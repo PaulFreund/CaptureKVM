@@ -21,6 +21,10 @@ Low-latency Windows viewer that pulls raw frames from an AVerMedia Live Gamer 4K
                           +-------------------------------+    (Video/Audio)
 ```
 
+## Demo
+
+[![YouTube demo video](https://img.youtube.com/vi/n5pnRM8FXPs/0.jpg)](https://www.youtube.com/watch?v=n5pnRM8FXPs)
+
 ## Prerequisites
 
 - Windows 10/11 with the GC573 installed and configured.
