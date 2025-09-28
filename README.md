@@ -31,6 +31,7 @@ Low-latency Windows viewer that pulls raw frames from an AVerMedia Live Gamer 4K
 - CMake 3.20 or newer.
 - Microsoft Visual Studio 2019/2022 with the MSVC x64 toolchain.
 - Official AVerMedia GC573 driver. For best presentation latency keep the window on the NVIDIA RTX 4070 driving your display.
+- A [CaptureKVMBridge](https://github.com/PaulFreund/CaptureKVMBridge) device
 
 ## Building
 
