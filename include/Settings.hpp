@@ -13,6 +13,12 @@ struct HotkeyConfig {
     bool requireWin = false;
 };
 
+enum class VideoAspectMode : unsigned int {
+    Stretch = 0,
+    Maintain = 1,
+    Capture = 2,
+};
+
 struct AppSettings {
     std::string videoDeviceMoniker;
     std::string audioDeviceMoniker;
@@ -24,6 +30,8 @@ struct AppSettings {
     bool mouseAbsoluteMode = true;
     std::string inputTargetDevice;
     unsigned int serialBaudRate = 921600;
+    bool videoAllowResizing = true;
+    VideoAspectMode videoAspectMode = VideoAspectMode::Maintain;
     HotkeyConfig menuHotkey;
 };
 

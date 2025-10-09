@@ -41,13 +41,16 @@ Low-latency Windows viewer that pulls raw frames from an AVerMedia Live Gamer 4K
    cmake --build build --config Release
    ```
 2. Run the viewer from the generated `Release` (or `Debug`) output directory.
-   - Audio playback can be toggled at runtime from the settings menu (Page Up + Home). The legacy `--enable-audio` flag still forces audio on at launch if you prefer.
+   - Audio playback can be toggled at runtime from the settings menu (`Ctrl` + `Alt` + `M`). The legacy `--enable-audio` flag still forces audio on at launch if you prefer.
 
 ## Runtime behaviour
 
 - The app enumerates the GC573 through DirectShow, builds a graph with the Sample Grabber filter, and streams 32-bit BGRA frames into the renderer without extra buffering.
 - Frames are uploaded into a D3D12 texture and drawn over a flip-model swapchain to minimise the presentation queue.
-- Press Page Up + Home at any time to open an in-window settings menu. Device choices and feature toggles persist in `settings.json` beside the executable.
+- Press `Ctrl` + `Alt` + `M` at any time to open an in-window settings menu. Device choices and feature toggles persist in `settings.json` beside the executable.
+- Video settings automatically track the capture card's native resolution and aspect ratio, resizing the viewer and pointer mapping as the source changes.
+- Optional letterboxing keeps the source aspect ratio when window resizing is enabled, so you can choose between freeform sizing or a forced fit with black bars.
+- A dedicated Video submenu exposes `Allow Resizing` plus an `Aspect Mode` selector (`Stretch`, `Force Aspect Ratio`, `Force Capture Resolution`) so you control how the capture is mapped into the window.
 - Optional audio playback, microphone capture, and keyboard/mouse streaming can all be toggled live without breaking the video pipeline.
 - TLV reports are pushed over the auto-detected COM port exposed by the `USB JTAG/serial debug unit` bridge (VID 303A, PID 1001), so the viewer immediately reconnects whenever the adapter is attached.
 - CPU-side double buffering keeps the capture callback decoupled from the render loop while maintaining low latency.

@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include <cstdint>
+#include <functional>
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -23,10 +24,23 @@ public:
                      std::uint32_t width,
                      std::uint32_t height);
 
-    void render();
+    void render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback = nullptr);
 
     void setDebugGradient(bool enable);
     [[nodiscard]] bool debugGradientEnabled() const { return debugGradient_; }
+
+    [[nodiscard]] ID3D12Device* device() const { return device_.Get(); }
+    [[nodiscard]] ID3D12CommandQueue* commandQueue() const { return commandQueue_.Get(); }
+    [[nodiscard]] ID3D12DescriptorHeap* srvHeap() const { return srvHeap_.Get(); }
+    [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE frameSrvCpuHandle() const { return srvHandleFrameCpu_; }
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE frameSrvGpuHandle() const { return srvHandleFrameGpu_; }
+    [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE imguiSrvCpuHandle() const { return srvHandleImGuiCpu_; }
+    [[nodiscard]] D3D12_GPU_DESCRIPTOR_HANDLE imguiSrvGpuHandle() const { return srvHandleImGuiGpu_; }
+    [[nodiscard]] DXGI_FORMAT renderTargetFormat() const { return DXGI_FORMAT_B8G8R8A8_UNORM; }
+    [[nodiscard]] UINT frameCount() const { return kFrameCount; }
+    [[nodiscard]] UINT srvDescriptorSize() const { return srvDescriptorSize_; }
+
+    void setViewportRect(float x, float y, float width, float height);
 
 private:
     struct FrameContext {
@@ -85,8 +99,11 @@ private:
     bool pendingUpload_[kFrameCount] = {};
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandleStart_{};
-    D3D12_CPU_DESCRIPTOR_HANDLE srvHandleCpu_{};
-    D3D12_GPU_DESCRIPTOR_HANDLE srvHandleGpu_{};
+    UINT srvDescriptorSize_ = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHandleFrameCpu_{};
+    D3D12_GPU_DESCRIPTOR_HANDLE srvHandleFrameGpu_{};
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHandleImGuiCpu_{};
+    D3D12_GPU_DESCRIPTOR_HANDLE srvHandleImGuiGpu_{};
     D3D12_GPU_DESCRIPTOR_HANDLE samplerHandleGpu_{};
 
     UINT rtvDescriptorSize_ = 0;

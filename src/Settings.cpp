@@ -332,12 +332,12 @@ SettingsManager::SettingsManager()
 HotkeyConfig SettingsManager::defaultMenuHotkey()
 {
     HotkeyConfig config;
-    config.virtualKey = VK_HOME;
-    config.chordVirtualKey = VK_PRIOR; // Page Up
-    config.requireCtrl = false;
+    config.virtualKey = 'M';
+    config.chordVirtualKey = 0;
+    config.requireCtrl = true;
     config.requireRightCtrl = false;
     config.requireShift = false;
-    config.requireAlt = false;
+    config.requireAlt = true;
     config.requireWin = false;
     return config;
 }
@@ -380,6 +380,24 @@ AppSettings SettingsManager::load()
     tryParseBool(content, "mouseAbsoluteMode", settings.mouseAbsoluteMode);
     tryParseString(content, "inputTargetDevice", settings.inputTargetDevice);
     tryParseUInt(content, "serialBaudRate", settings.serialBaudRate);
+    tryParseBool(content, "videoAllowResizing", settings.videoAllowResizing);
+
+    unsigned int aspectModeValue = static_cast<unsigned int>(settings.videoAspectMode);
+    if (tryParseUInt(content, "videoAspectMode", aspectModeValue))
+    {
+        if (aspectModeValue <= static_cast<unsigned int>(VideoAspectMode::Capture))
+        {
+            settings.videoAspectMode = static_cast<VideoAspectMode>(aspectModeValue);
+        }
+    }
+    else
+    {
+        bool legacyForceAspect = true;
+        if (tryParseBool(content, "videoForceAspectRatio", legacyForceAspect))
+        {
+            settings.videoAspectMode = legacyForceAspect ? VideoAspectMode::Maintain : VideoAspectMode::Stretch;
+        }
+    }
     parseMenuHotkey(content, settings.menuHotkey);
 
     const bool legacyMenuHotkey =
@@ -391,7 +409,16 @@ AppSettings SettingsManager::load()
         !settings.menuHotkey.requireAlt &&
         !settings.menuHotkey.requireWin;
 
-    if (legacyMenuHotkey)
+    const bool legacyHomeMenuHotkey =
+        settings.menuHotkey.virtualKey == VK_HOME &&
+        settings.menuHotkey.chordVirtualKey == VK_PRIOR &&
+        !settings.menuHotkey.requireCtrl &&
+        !settings.menuHotkey.requireRightCtrl &&
+        !settings.menuHotkey.requireShift &&
+        !settings.menuHotkey.requireAlt &&
+        !settings.menuHotkey.requireWin;
+
+    if (legacyMenuHotkey || legacyHomeMenuHotkey)
     {
         settings.menuHotkey = defaultMenuHotkey();
     }
@@ -424,6 +451,8 @@ void SettingsManager::save(const AppSettings& settings) const
     file << "  \"mouseAbsoluteMode\": " << (settings.mouseAbsoluteMode ? "true" : "false") << ",\n";
     file << "  \"inputTargetDevice\": \"" << escapeJson(settings.inputTargetDevice) << "\",\n";
     file << "  \"serialBaudRate\": " << settings.serialBaudRate << ",\n";
+    file << "  \"videoAllowResizing\": " << (settings.videoAllowResizing ? "true" : "false") << ",\n";
+    file << "  \"videoAspectMode\": " << static_cast<unsigned int>(settings.videoAspectMode) << ",\n";
     file << "  \"menuHotkey\": {\n";
     file << "    \"virtualKey\": \"VK_0x";
     file << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << settings.menuHotkey.virtualKey;

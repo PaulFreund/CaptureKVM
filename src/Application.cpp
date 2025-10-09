@@ -18,6 +18,7 @@
 #include <string_view>
 #include <stdexcept>
 #include <thread>
+#include <cmath>
 #include <shellapi.h>
 
 namespace
@@ -26,13 +27,7 @@ namespace
     constexpr int kDefaultWidth = 1920;
     constexpr int kDefaultHeight = 1080;
 
-    constexpr unsigned int kCommandToggleAudioPlayback = 0x0100;
-    constexpr unsigned int kCommandToggleMicrophoneCapture = 0x0101;
-    constexpr unsigned int kCommandToggleInputCapture = 0x0102;
-    constexpr unsigned int kCommandVideoDeviceBase = 0x1000;
-    constexpr unsigned int kCommandAudioUseVideoSource = 0x10FE;
-    constexpr unsigned int kCommandAudioDeviceBase = 0x1100;
-    constexpr unsigned int kCommandMicrophoneDeviceBase = 0x1200;
+    constexpr UINT_PTR kTimerRenderDuringInteraction = 0x7101;
     const std::string kAudioSourceVideoSentinel = "@video";
 
     std::wstring utf8ToWide(const std::string& text)
@@ -102,6 +97,12 @@ int Application::run()
     }
     logApp("[App] Renderer initialized");
 
+    if (!overlay_.initialize(hwnd_, renderer_))
+    {
+        logApp("[App] Failed to initialize ImGui overlay");
+        // Continue without overlay
+    }
+
     running_ = true;
 
     logApp("[App] Starting DirectShow capture");
@@ -151,6 +152,7 @@ int Application::run()
     std::string captureError = directShowCapture_.consumeLastError();
     const bool anyFrames = frameCounter_.load(std::memory_order_acquire) > 0;
 
+    overlay_.shutdown();
     renderer_.shutdown();
     logApp("[App] Renderer shutdown");
 
@@ -225,6 +227,11 @@ LRESULT CALLBACK Application::windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
+    if (self->overlay_.processEvent(hwnd, msg, wParam, lParam))
+    {
+        return 1;
+    }
+
     switch (msg)
     {
     case WM_SIZE:
@@ -239,11 +246,55 @@ LRESULT CALLBACK Application::windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     case WM_MOVE:
         self->updateInputCaptureBounds();
         return 0;
-    case WM_SHOWWINDOW:
-    case WM_ACTIVATE:
+    case WM_ENTERSIZEMOVE:
+        SetTimer(hwnd, kTimerRenderDuringInteraction, 16, nullptr);
+        self->renderFrame(true);
+        return 0;
+    case WM_EXITSIZEMOVE:
+        KillTimer(hwnd, kTimerRenderDuringInteraction);
+        self->renderFrame(true);
+        self->updateInputCaptureBounds();
+        return 0;
+    case WM_TIMER:
+        if (wParam == kTimerRenderDuringInteraction)
+        {
+            self->renderFrame(true);
+            return 0;
+        }
+        return 0;
     case WM_ACTIVATEAPP:
+        if (wParam)
+        {
+            self->registerMenuHotkey();
+        }
+        else
+        {
+            self->unregisterMenuHotkey();
+            self->inputCaptureManager_.clearModifierState();
+        }
+        self->updateInputCaptureBounds();
+        return 0;
     case WM_SETFOCUS:
+        self->registerMenuHotkey();
+        self->updateInputCaptureBounds();
+        return 0;
     case WM_KILLFOCUS:
+        self->unregisterMenuHotkey();
+        self->inputCaptureManager_.clearModifierState();
+        self->updateInputCaptureBounds();
+        return 0;
+    case WM_SHOWWINDOW:
+        if (!wParam)
+        {
+            self->inputCaptureManager_.clearModifierState();
+        }
+        self->updateInputCaptureBounds();
+        return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE)
+        {
+            self->inputCaptureManager_.clearModifierState();
+        }
         self->updateInputCaptureBounds();
         return 0;
     case WM_KEYDOWN:
@@ -251,6 +302,12 @@ LRESULT CALLBACK Application::windowProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         {
             const bool newState = !self->renderer_.debugGradientEnabled();
             self->renderer_.setDebugGradient(newState);
+            return 0;
+        }
+        break;
+    case WM_GETMINMAXINFO:
+        if (self->applyLockedWindowSize(reinterpret_cast<MINMAXINFO*>(lParam)))
+        {
             return 0;
         }
         break;
@@ -343,6 +400,13 @@ bool Application::createWindow(int width, int height)
     UpdateWindow(hwnd_);
     inputCaptureManager_.setTargetWindow(hwnd_);
     updateInputCaptureBounds();
+    RECT initialClient{};
+    if (GetClientRect(hwnd_, &initialClient))
+    {
+        lockedClientWidth_ = initialClient.right - initialClient.left;
+        lockedClientHeight_ = initialClient.bottom - initialClient.top;
+    }
+    updateWindowResizeMode();
     logApp("[App] Window created");
     return true;
 }
@@ -373,6 +437,17 @@ void Application::handleFrame(const DirectShowCapture::Frame& frame)
     dst.timestamp100ns = frame.timestamp100ns;
     dst.width = frame.width;
     dst.height = frame.height;
+
+    const std::uint32_t frameWidth = frame.width;
+    const std::uint32_t frameHeight = frame.height;
+    const std::uint32_t knownWidth = currentSourceWidth_.load(std::memory_order_acquire);
+    const std::uint32_t knownHeight = currentSourceHeight_.load(std::memory_order_acquire);
+    if (frameWidth != knownWidth || frameHeight != knownHeight)
+    {
+        pendingSourceWidth_.store(frameWidth, std::memory_order_release);
+        pendingSourceHeight_.store(frameHeight, std::memory_order_release);
+        sourceChangePending_.store(true, std::memory_order_release);
+    }
 
     inputCaptureManager_.setTargetResolution(static_cast<int>(frame.width), static_cast<int>(frame.height));
 
@@ -484,30 +559,18 @@ void Application::renderLoop()
             DispatchMessage(&msg);
         }
 
-        bool presented = false;
+        if (sourceChangePending_.load(std::memory_order_acquire))
         {
-            std::unique_lock<std::mutex> lock(frameMutex_, std::try_to_lock);
-            if (lock.owns_lock())
+            const std::uint32_t newWidth = pendingSourceWidth_.load(std::memory_order_acquire);
+            const std::uint32_t newHeight = pendingSourceHeight_.load(std::memory_order_acquire);
+            if (newWidth != 0 && newHeight != 0)
             {
-                const std::uint64_t latest = frameCounter_.load(std::memory_order_acquire);
-                if (latest != lastPresentedFrame_)
-                {
-                    const CpuFrame& src = frames_[frontBufferIndex_];
-                    renderer_.uploadFrame(src.data.data(), src.stride, src.width, src.height);
-                    lastPresentedFrame_ = latest;
-                    presented = true;
-                }
+                applySourceDimensions(newWidth, newHeight);
             }
+            sourceChangePending_.store(false, std::memory_order_release);
         }
 
-        if (presented)
-        {
-            renderer_.render();
-        }
-        else
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        renderFrame(false);
     }
 }
 
@@ -541,6 +604,8 @@ bool Application::registerMenuHotkey()
 {
     if (!hwnd_)
     {
+        menuHotkeyRegistered_ = false;
+        inputCaptureManager_.setMenuChordEnabled(false);
         return false;
     }
 
@@ -572,238 +637,31 @@ bool Application::registerMenuHotkey()
         modifiers |= MOD_WIN;
     }
 
+    inputCaptureManager_.setMenuChordEnabled(true);
+
     if (RegisterHotKey(hwnd_, static_cast<int>(menuHotkeyId_), modifiers, static_cast<UINT>(hotkey.virtualKey)))
     {
+        menuHotkeyRegistered_ = true;
         return true;
     }
 
+    menuHotkeyRegistered_ = false;
     return false;
 }
 
 void Application::unregisterMenuHotkey()
 {
-    if (hwnd_)
+    if (hwnd_ && menuHotkeyRegistered_)
     {
         UnregisterHotKey(hwnd_, static_cast<int>(menuHotkeyId_));
     }
+    menuHotkeyRegistered_ = false;
+    inputCaptureManager_.setMenuChordEnabled(false);
 }
 
 void Application::showSettingsMenu()
 {
-    videoCommandMap_.clear();
-    audioCommandMap_.clear();
-    microphoneCommandMap_.clear();
-
-    HMENU rootMenu = CreatePopupMenu();
-    if (!rootMenu)
-    {
-        return;
-    }
-
-    auto videoDevices = enumerateVideoCaptureDevices();
-    std::wstring selectedVideoFriendly;
-    HMENU videoMenu = CreatePopupMenu();
-    if (videoMenu)
-    {
-        if (videoDevices.empty())
-        {
-            AppendMenuW(videoMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"No video capture devices");
-        }
-        else
-        {
-            for (std::size_t i = 0; i < videoDevices.size(); ++i)
-            {
-                const auto& device = videoDevices[i];
-                const UINT commandId = kCommandVideoDeviceBase + static_cast<UINT>(i);
-                videoCommandMap_[commandId] = device.monikerDisplayName;
-                std::wstring label = utf8ToWide(device.friendlyName.empty() ? device.monikerDisplayName : device.friendlyName);
-                UINT flags = MF_STRING;
-                if (!settings_.videoDeviceMoniker.empty() && settings_.videoDeviceMoniker == device.monikerDisplayName)
-                {
-                    flags |= MF_CHECKED;
-                    selectedVideoFriendly = label;
-                }
-                AppendMenuW(videoMenu, flags, commandId, label.c_str());
-            }
-        }
-        AppendMenuW(rootMenu, MF_POPUP | (videoDevices.empty() ? MF_DISABLED | MF_GRAYED : 0u), reinterpret_cast<UINT_PTR>(videoMenu), L"Video Capture Source");
-    }
-
-    auto audioDevices = enumerateAudioCaptureDevices();
-    HMENU audioMenu = CreatePopupMenu();
-    if (audioMenu)
-    {
-        bool anyAudioEntries = false;
-        if (!settings_.videoDeviceMoniker.empty())
-        {
-            std::wstring label = L"Use Video Source Audio";
-            if (!selectedVideoFriendly.empty())
-            {
-                label += L" (" + selectedVideoFriendly + L")";
-            }
-            UINT flags = MF_STRING;
-            if (shouldUseVideoAudio())
-            {
-                flags |= MF_CHECKED;
-            }
-            AppendMenuW(audioMenu, flags, kCommandAudioUseVideoSource, label.c_str());
-            audioCommandMap_[kCommandAudioUseVideoSource] = kAudioSourceVideoSentinel;
-            anyAudioEntries = true;
-        }
-
-        if (!audioDevices.empty())
-        {
-            if (anyAudioEntries)
-            {
-                AppendMenuW(audioMenu, MF_SEPARATOR, 0, nullptr);
-            }
-            for (std::size_t i = 0; i < audioDevices.size(); ++i)
-            {
-                const auto& device = audioDevices[i];
-                const UINT commandId = kCommandAudioDeviceBase + static_cast<UINT>(i);
-                audioCommandMap_[commandId] = device.monikerDisplayName;
-                std::wstring label = utf8ToWide(device.friendlyName.empty() ? device.monikerDisplayName : device.friendlyName);
-                UINT flags = MF_STRING;
-                if (!shouldUseVideoAudio() && !settings_.audioDeviceMoniker.empty() && settings_.audioDeviceMoniker == device.monikerDisplayName)
-                {
-                    flags |= MF_CHECKED;
-                }
-                AppendMenuW(audioMenu, flags, commandId, label.c_str());
-            }
-            anyAudioEntries = true;
-        }
-
-        if (!anyAudioEntries)
-        {
-            AppendMenuW(audioMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"No audio capture devices");
-        }
-
-        AppendMenuW(rootMenu, MF_POPUP | (!anyAudioEntries ? MF_DISABLED | MF_GRAYED : 0u), reinterpret_cast<UINT_PTR>(audioMenu), L"Audio Capture Source");
-    }
-
-    auto microphones = enumerateMicrophoneDevices();
-    HMENU microphoneMenu = CreatePopupMenu();
-    if (microphoneMenu)
-    {
-        if (microphones.empty())
-        {
-            AppendMenuW(microphoneMenu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, L"No microphone devices");
-        }
-        else
-        {
-            for (std::size_t i = 0; i < microphones.size(); ++i)
-            {
-                const auto& device = microphones[i];
-                const UINT commandId = kCommandMicrophoneDeviceBase + static_cast<UINT>(i);
-                microphoneCommandMap_[commandId] = device.endpointId;
-                std::wstring label = utf8ToWide(device.friendlyName.empty() ? device.endpointId : device.friendlyName);
-                UINT flags = MF_STRING;
-                if (!settings_.microphoneDeviceId.empty() && settings_.microphoneDeviceId == device.endpointId)
-                {
-                    flags |= MF_CHECKED;
-                }
-                AppendMenuW(microphoneMenu, flags, commandId, label.c_str());
-            }
-        }
-        AppendMenuW(rootMenu, MF_POPUP | (microphones.empty() ? MF_DISABLED | MF_GRAYED : 0u), reinterpret_cast<UINT_PTR>(microphoneMenu), L"Microphone Device");
-    }
-
-    AppendMenuW(rootMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(rootMenu, MF_STRING | (settings_.audioPlaybackEnabled ? MF_CHECKED : 0u), kCommandToggleAudioPlayback, L"Enable Audio Playback");
-    AppendMenuW(rootMenu, MF_STRING | (settings_.microphoneCaptureEnabled ? MF_CHECKED : 0u), kCommandToggleMicrophoneCapture, L"Enable Microphone Capture");
-    AppendMenuW(rootMenu, MF_STRING | (settings_.inputCaptureEnabled ? MF_CHECKED : 0u), kCommandToggleInputCapture, L"Enable Keyboard && Mouse Capture");
-
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    SetForegroundWindow(hwnd_);
-    const UINT command = TrackPopupMenu(rootMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, cursor.x, cursor.y, 0, hwnd_, nullptr);
-    DestroyMenu(rootMenu);
-
-    if (command != 0)
-    {
-        handleMenuSelection(command);
-    }
-}
-
-void Application::handleMenuSelection(unsigned int commandId)
-{
-    if (commandId == 0)
-    {
-        return;
-    }
-
-    if (commandId == kCommandToggleAudioPlayback)
-    {
-        settings_.audioPlaybackEnabled = !settings_.audioPlaybackEnabled;
-        if (settings_.audioPlaybackEnabled && settings_.audioDeviceMoniker.empty())
-        {
-            settings_.audioDeviceMoniker = kAudioSourceVideoSentinel;
-        }
-        savePersistentSettings();
-        logApp(std::string("[App] Audio playback toggled -> ") + (settings_.audioPlaybackEnabled ? "enabled" : "disabled"));
-        applyAudioPlaybackSetting();
-        return;
-    }
-    if (commandId == kCommandToggleMicrophoneCapture)
-    {
-        settings_.microphoneCaptureEnabled = !settings_.microphoneCaptureEnabled;
-        savePersistentSettings();
-        logApp(std::string("[App] Microphone capture toggled -> ") + (settings_.microphoneCaptureEnabled ? "enabled" : "disabled"));
-        applyMicrophoneCaptureSetting();
-        return;
-    }
-    if (commandId == kCommandToggleInputCapture)
-    {
-        settings_.inputCaptureEnabled = !settings_.inputCaptureEnabled;
-        savePersistentSettings();
-        logApp(std::string("[App] Input capture toggled -> ") + (settings_.inputCaptureEnabled ? "enabled" : "disabled"));
-        applyInputCaptureSetting();
-        return;
-    }
-    if (auto it = videoCommandMap_.find(commandId); it != videoCommandMap_.end())
-    {
-        if (settings_.videoDeviceMoniker != it->second)
-        {
-            settings_.videoDeviceMoniker = it->second;
-            savePersistentSettings();
-            logApp(std::string("[App] Selected video capture device: ") + settings_.videoDeviceMoniker);
-            restartVideoCapture();
-            if (settings_.audioDeviceMoniker == kAudioSourceVideoSentinel && settings_.audioPlaybackEnabled)
-            {
-                applyAudioPlaybackSetting();
-            }
-        }
-        return;
-    }
-
-    if (auto it = audioCommandMap_.find(commandId); it != audioCommandMap_.end())
-    {
-        if (settings_.audioDeviceMoniker != it->second)
-        {
-            settings_.audioDeviceMoniker = it->second;
-            savePersistentSettings();
-        }
-        const std::string logLabel = settings_.audioDeviceMoniker == kAudioSourceVideoSentinel ? std::string("video source audio") : settings_.audioDeviceMoniker;
-        logApp(std::string("[App] Selected audio capture device: ") + logLabel);
-        applyAudioPlaybackSetting();
-        return;
-    }
-
-    if (auto it = microphoneCommandMap_.find(commandId); it != microphoneCommandMap_.end())
-    {
-        if (settings_.microphoneDeviceId != it->second)
-        {
-            settings_.microphoneDeviceId = it->second;
-            savePersistentSettings();
-            logApp(std::string("[App] Selected microphone device: ") + settings_.microphoneDeviceId);
-            if (settings_.microphoneCaptureEnabled)
-            {
-                applyMicrophoneCaptureSetting();
-            }
-        }
-        return;
-    }
-
+    overlay_.toggleMenu(*this);
 }
 
 bool Application::isMenuHotkeySatisfied() const
@@ -896,6 +754,14 @@ void Application::applyInputCaptureSetting()
     settings_.mouseAbsoluteMode = true;
     inputCaptureManager_.setAbsoluteMode(true);
     inputCaptureManager_.setEnabled(settings_.inputCaptureEnabled);
+    if (menuHotkeyRegistered_)
+    {
+        inputCaptureManager_.setMenuChordEnabled(true);
+    }
+    else
+    {
+        inputCaptureManager_.setMenuChordEnabled(false);
+    }
 }
 
 void Application::applyMicrophoneCaptureSetting()
@@ -920,11 +786,413 @@ void Application::applySerialTargetSetting()
     serialStreamer_.requestReconnect();
 }
 
+void Application::setAudioPlaybackEnabled(bool enabled)
+{
+    if (settings_.audioPlaybackEnabled == enabled)
+    {
+        return;
+    }
+
+    settings_.audioPlaybackEnabled = enabled;
+    if (settings_.audioPlaybackEnabled && settings_.audioDeviceMoniker.empty())
+    {
+        settings_.audioDeviceMoniker = kAudioSourceVideoSentinel;
+    }
+    savePersistentSettings();
+    logApp(std::string("[App] Audio playback toggled -> ") + (settings_.audioPlaybackEnabled ? "enabled" : "disabled"));
+    applyAudioPlaybackSetting();
+}
+
+void Application::setMicrophoneCaptureEnabled(bool enabled)
+{
+    if (settings_.microphoneCaptureEnabled == enabled)
+    {
+        return;
+    }
+
+    settings_.microphoneCaptureEnabled = enabled;
+    savePersistentSettings();
+    logApp(std::string("[App] Microphone capture toggled -> ") + (settings_.microphoneCaptureEnabled ? "enabled" : "disabled"));
+    applyMicrophoneCaptureSetting();
+}
+
+void Application::setInputCaptureEnabled(bool enabled)
+{
+    if (settings_.inputCaptureEnabled == enabled)
+    {
+        return;
+    }
+
+    settings_.inputCaptureEnabled = enabled;
+    savePersistentSettings();
+    logApp(std::string("[App] Input capture toggled -> ") + (settings_.inputCaptureEnabled ? "enabled" : "disabled"));
+    applyInputCaptureSetting();
+}
+
+void Application::selectVideoDevice(const std::string& moniker)
+{
+    if (settings_.videoDeviceMoniker == moniker)
+    {
+        return;
+    }
+
+    settings_.videoDeviceMoniker = moniker;
+    savePersistentSettings();
+    logApp(std::string("[App] Selected video capture device: ") + settings_.videoDeviceMoniker);
+    restartVideoCapture();
+    if (settings_.audioDeviceMoniker == kAudioSourceVideoSentinel && settings_.audioPlaybackEnabled)
+    {
+        applyAudioPlaybackSetting();
+    }
+    requestImmediateRender();
+}
+
+void Application::selectAudioDevice(const std::string& moniker)
+{
+    std::string newMoniker = moniker.empty() ? kAudioSourceVideoSentinel : moniker;
+    if (settings_.audioDeviceMoniker == newMoniker)
+    {
+        return;
+    }
+
+    settings_.audioDeviceMoniker = newMoniker;
+    savePersistentSettings();
+    const std::string logLabel = (settings_.audioDeviceMoniker == kAudioSourceVideoSentinel) ? std::string("video source audio") : settings_.audioDeviceMoniker;
+    logApp(std::string("[App] Selected audio capture device: ") + logLabel);
+    applyAudioPlaybackSetting();
+    requestImmediateRender();
+}
+
+void Application::selectMicrophoneDevice(const std::string& endpointId)
+{
+    if (settings_.microphoneDeviceId == endpointId)
+    {
+        return;
+    }
+
+    settings_.microphoneDeviceId = endpointId;
+    savePersistentSettings();
+    logApp(std::string("[App] Selected microphone device: ") + settings_.microphoneDeviceId);
+    if (settings_.microphoneCaptureEnabled)
+    {
+        applyMicrophoneCaptureSetting();
+    }
+    requestImmediateRender();
+}
+
+void Application::setVideoAllowResizing(bool enabled)
+{
+    if (settings_.videoAllowResizing == enabled)
+    {
+        return;
+    }
+
+    settings_.videoAllowResizing = enabled;
+    savePersistentSettings();
+    logApp(std::string("[App] Video allow resizing -> ") + (settings_.videoAllowResizing ? "enabled" : "disabled"));
+    updateWindowResizeMode();
+
+    if (!settings_.videoAllowResizing)
+    {
+        const std::uint32_t srcW = currentSourceWidth_.load(std::memory_order_acquire);
+        const std::uint32_t srcH = currentSourceHeight_.load(std::memory_order_acquire);
+        if (srcW > 0 && srcH > 0)
+        {
+            lockedClientWidth_ = static_cast<int>(srcW);
+            lockedClientHeight_ = static_cast<int>(srcH);
+        }
+        else if (hwnd_)
+        {
+            RECT client{};
+            if (GetClientRect(hwnd_, &client))
+            {
+                lockedClientWidth_ = client.right - client.left;
+                lockedClientHeight_ = client.bottom - client.top;
+            }
+        }
+
+        if (lockedClientWidth_ > 0 && lockedClientHeight_ > 0)
+        {
+            resizeWindowToClient(lockedClientWidth_, lockedClientHeight_);
+        }
+    }
+
+    updateInputCaptureBounds();
+    requestImmediateRender();
+}
+
+void Application::setVideoAspectMode(VideoAspectMode mode)
+{
+    if (settings_.videoAspectMode == mode)
+    {
+        return;
+    }
+
+    settings_.videoAspectMode = mode;
+    savePersistentSettings();
+    logApp(std::string("[App] Video aspect mode -> ") + std::to_string(static_cast<unsigned int>(mode)));
+    updateInputCaptureBounds();
+    requestImmediateRender();
+}
+
+void Application::requestImmediateRender()
+{
+    forceRender_.store(true, std::memory_order_release);
+}
+
+bool Application::uploadLatestFrame()
+{
+    std::unique_lock<std::mutex> lock(frameMutex_, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        return false;
+    }
+
+    const std::uint64_t latest = frameCounter_.load(std::memory_order_acquire);
+    if (latest == lastPresentedFrame_)
+    {
+        return false;
+    }
+
+    const CpuFrame& src = frames_[frontBufferIndex_];
+    if (src.data.empty() || src.width == 0 || src.height == 0)
+    {
+        return false;
+    }
+
+    renderer_.uploadFrame(src.data.data(), src.stride, src.width, src.height);
+    lastPresentedFrame_ = latest;
+    return true;
+}
+
+void Application::renderFrame(bool forcePresent)
+{
+    overlay_.newFrame();
+    overlay_.buildUI(*this);
+    overlay_.endFrame();
+
+    const bool uploaded = uploadLatestFrame();
+    const bool forced = forcePresent || forceRender_.exchange(false, std::memory_order_acq_rel);
+    const bool overlayHasDraw = overlay_.hasDrawData();
+    const bool hasFrame = (lastPresentedFrame_ != 0);
+
+    if (uploaded || forced || overlayHasDraw || (forcePresent && hasFrame))
+    {
+        renderer_.render([&](ID3D12GraphicsCommandList* cmdList) {
+            overlay_.render(cmdList);
+        });
+    }
+    else if (!forcePresent)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void Application::applySourceDimensions(std::uint32_t width, std::uint32_t height)
+{
+    if (width == 0 || height == 0)
+    {
+        return;
+    }
+
+    currentSourceWidth_.store(width, std::memory_order_release);
+    currentSourceHeight_.store(height, std::memory_order_release);
+
+    lockedClientWidth_ = static_cast<int>(width);
+    lockedClientHeight_ = static_cast<int>(height);
+
+    if (hwnd_)
+    {
+        resizeWindowToClient(static_cast<int>(width), static_cast<int>(height));
+        updateWindowResizeMode();
+        updateInputCaptureBounds();
+    }
+}
+
+bool Application::resizeWindowToClient(int width, int height)
+{
+    if (!hwnd_ || width <= 0 || height <= 0)
+    {
+        return false;
+    }
+
+    RECT current{};
+    if (!GetClientRect(hwnd_, &current))
+    {
+        return false;
+    }
+
+    const int currentWidth = current.right - current.left;
+    const int currentHeight = current.bottom - current.top;
+    if (currentWidth == width && currentHeight == height)
+    {
+        return false;
+    }
+
+    RECT desired{0, 0, width, height};
+    DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd_, GWL_STYLE));
+    DWORD exStyle = static_cast<DWORD>(GetWindowLongPtr(hwnd_, GWL_EXSTYLE));
+    if (!AdjustWindowRectEx(&desired, style, FALSE, exStyle))
+    {
+        return false;
+    }
+
+    const int windowWidth = desired.right - desired.left;
+    const int windowHeight = desired.bottom - desired.top;
+
+    if (!SetWindowPos(hwnd_, nullptr, 0, 0, windowWidth, windowHeight,
+                      SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOSENDCHANGING))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+void Application::updateWindowResizeMode()
+{
+    if (!hwnd_)
+    {
+        return;
+    }
+
+    LONG_PTR style = GetWindowLongPtr(hwnd_, GWL_STYLE);
+    if (style == 0)
+    {
+        return;
+    }
+
+    const LONG_PTR desiredStyle = settings_.videoAllowResizing
+        ? (style | WS_THICKFRAME | WS_MAXIMIZEBOX)
+        : (style & ~(WS_THICKFRAME | WS_MAXIMIZEBOX));
+
+    if (desiredStyle != style)
+    {
+        SetWindowLongPtr(hwnd_, GWL_STYLE, desiredStyle);
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+}
+
+bool Application::applyLockedWindowSize(MINMAXINFO* info) const
+{
+    if (!info || settings_.videoAllowResizing || !hwnd_ || lockedClientWidth_ <= 0 || lockedClientHeight_ <= 0)
+    {
+        return false;
+    }
+
+    RECT rect{0, 0, lockedClientWidth_, lockedClientHeight_};
+    DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd_, GWL_STYLE));
+    DWORD exStyle = static_cast<DWORD>(GetWindowLongPtr(hwnd_, GWL_EXSTYLE));
+    if (!AdjustWindowRectEx(&rect, style, FALSE, exStyle))
+    {
+        return false;
+    }
+
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    info->ptMinTrackSize.x = width;
+    info->ptMinTrackSize.y = height;
+    info->ptMaxTrackSize.x = width;
+    info->ptMaxTrackSize.y = height;
+    return true;
+}
+
+RECT Application::computeVideoViewport(const RECT& clientRect, bool& valid) const
+{
+    valid = false;
+    RECT viewport{0, 0, 0, 0};
+
+    const LONG clientWidth = clientRect.right - clientRect.left;
+    const LONG clientHeight = clientRect.bottom - clientRect.top;
+    if (clientWidth <= 0 || clientHeight <= 0)
+    {
+        return viewport;
+    }
+
+    const std::uint32_t srcWidth = currentSourceWidth_.load(std::memory_order_acquire);
+    const std::uint32_t srcHeight = currentSourceHeight_.load(std::memory_order_acquire);
+    if (srcWidth == 0 || srcHeight == 0)
+    {
+        return viewport;
+    }
+
+    switch (settings_.videoAspectMode)
+    {
+    case VideoAspectMode::Stretch:
+        viewport.left = 0;
+        viewport.top = 0;
+        viewport.right = clientWidth;
+        viewport.bottom = clientHeight;
+        valid = true;
+        return viewport;
+
+    case VideoAspectMode::Maintain:
+    {
+        const double srcAspect = static_cast<double>(srcWidth) / static_cast<double>(srcHeight);
+        const double clientAspect = static_cast<double>(clientWidth) / static_cast<double>(clientHeight);
+        constexpr double epsilon = 1e-4;
+
+        int viewportWidth = static_cast<int>(clientWidth);
+        int viewportHeight = static_cast<int>(clientHeight);
+        if (std::abs(clientAspect - srcAspect) > epsilon)
+        {
+            if (clientAspect > srcAspect)
+            {
+                viewportHeight = static_cast<int>(clientHeight);
+                viewportWidth = static_cast<int>(std::round(static_cast<double>(viewportHeight) * srcAspect));
+            }
+            else
+            {
+                viewportWidth = static_cast<int>(clientWidth);
+                viewportHeight = static_cast<int>(std::round(static_cast<double>(viewportWidth) / srcAspect));
+            }
+        }
+
+        viewportWidth = std::max(1, std::min(viewportWidth, static_cast<int>(clientWidth)));
+        viewportHeight = std::max(1, std::min(viewportHeight, static_cast<int>(clientHeight)));
+
+        const int offsetX = (static_cast<int>(clientWidth) - viewportWidth) / 2;
+        const int offsetY = (static_cast<int>(clientHeight) - viewportHeight) / 2;
+
+        viewport.left = offsetX;
+        viewport.top = offsetY;
+        viewport.right = offsetX + viewportWidth;
+        viewport.bottom = offsetY + viewportHeight;
+        valid = true;
+        return viewport;
+    }
+
+    case VideoAspectMode::Capture:
+    {
+        double scale = std::min<double>({static_cast<double>(clientWidth) / static_cast<double>(srcWidth),
+                                         static_cast<double>(clientHeight) / static_cast<double>(srcHeight),
+                                         1.0});
+        int viewportWidth = static_cast<int>(std::round(static_cast<double>(srcWidth) * scale));
+        int viewportHeight = static_cast<int>(std::round(static_cast<double>(srcHeight) * scale));
+        viewportWidth = std::max(1, std::min(viewportWidth, static_cast<int>(clientWidth)));
+        viewportHeight = std::max(1, std::min(viewportHeight, static_cast<int>(clientHeight)));
+        const int offsetX = (static_cast<int>(clientWidth) - viewportWidth) / 2;
+        const int offsetY = (static_cast<int>(clientHeight) - viewportHeight) / 2;
+        viewport.left = offsetX;
+        viewport.top = offsetY;
+        viewport.right = offsetX + viewportWidth;
+        viewport.bottom = offsetY + viewportHeight;
+        valid = true;
+        return viewport;
+    }
+    }
+
+    return viewport;
+}
+
 void Application::updateInputCaptureBounds()
 {
     if (!hwnd_ || !IsWindowVisible(hwnd_))
     {
         inputCaptureManager_.setCaptureRegion(RECT{}, false);
+        inputCaptureManager_.setVideoViewport(RECT{}, false);
+        renderer_.setViewportRect(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
 
@@ -932,6 +1200,7 @@ void Application::updateInputCaptureBounds()
     if (!GetClientRect(hwnd_, &client))
     {
         inputCaptureManager_.setCaptureRegion(RECT{}, false);
+        inputCaptureManager_.setVideoViewport(RECT{}, false);
         return;
     }
 
@@ -942,14 +1211,38 @@ void Application::updateInputCaptureBounds()
 
     RECT screenRect{topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
 
-    if (IsIconic(hwnd_) || GetForegroundWindow() != hwnd_)
+    const bool windowHasArea = (screenRect.right > screenRect.left) && (screenRect.bottom > screenRect.top);
+    const bool windowActive = !IsIconic(hwnd_) && GetForegroundWindow() == hwnd_ && windowHasArea;
+    inputCaptureManager_.setCaptureRegion(screenRect, windowActive);
+
+    bool viewportValid = false;
+    RECT viewportClient = computeVideoViewport(client, viewportValid);
+
+    if (!viewportValid)
     {
-        inputCaptureManager_.setCaptureRegion(screenRect, false);
+        inputCaptureManager_.setVideoViewport(RECT{}, false);
+        const LONG clientWidth = client.right - client.left;
+        const LONG clientHeight = client.bottom - client.top;
+        renderer_.setViewportRect(0.0f,
+                                  0.0f,
+                                  static_cast<float>(std::max<LONG>(clientWidth, 0)),
+                                  static_cast<float>(std::max<LONG>(clientHeight, 0)));
+        return;
     }
-    else
-    {
-        inputCaptureManager_.setCaptureRegion(screenRect, screenRect.right > screenRect.left && screenRect.bottom > screenRect.top);
-    }
+
+    RECT viewportScreen{
+        topLeft.x + viewportClient.left,
+        topLeft.y + viewportClient.top,
+        topLeft.x + viewportClient.right,
+        topLeft.y + viewportClient.bottom
+    };
+
+    inputCaptureManager_.setVideoViewport(viewportScreen, viewportValid && windowActive);
+
+    renderer_.setViewportRect(static_cast<float>(viewportClient.left),
+                              static_cast<float>(viewportClient.top),
+                              static_cast<float>(viewportClient.right - viewportClient.left),
+                              static_cast<float>(viewportClient.bottom - viewportClient.top));
 }
 
 bool Application::shouldUseVideoAudio() const

@@ -18,11 +18,20 @@ add_executable(pckvm
     src/InputCapture.cpp
     src/MicrophoneCapture.cpp
     src/AudioPlayback.cpp
+    src/OverlayUI.cpp
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/backends/imgui_impl_dx12.cpp
+    third_party/imgui/backends/imgui_impl_win32.cpp
 )
 
 target_include_directories(pckvm
     PRIVATE
         include
+        third_party/imgui
+        third_party/imgui/backends
 )
 
 if(MSVC)

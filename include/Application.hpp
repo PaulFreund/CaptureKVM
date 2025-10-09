@@ -9,8 +9,7 @@
 #include "InputCapture.hpp"
 #include "MicrophoneCapture.hpp"
 #include "AudioPlayback.hpp"
-#include <unordered_map>
-#include <vector>
+#include "OverlayUI.hpp"
 
 #include <Windows.h>
 #include <atomic>
@@ -25,6 +24,7 @@ public:
     int run();
 
 private:
+    friend class OverlayUI;
     struct CpuFrame {
         std::uint32_t width = 0;
         std::uint32_t height = 0;
@@ -44,7 +44,6 @@ private:
     bool registerMenuHotkey();
     void unregisterMenuHotkey();
     void showSettingsMenu();
-    void handleMenuSelection(unsigned int commandId);
     bool isMenuHotkeySatisfied() const;
     void applyAudioPlaybackSetting();
     void applyInputCaptureSetting();
@@ -54,6 +53,25 @@ private:
     void restartVideoCapture();
     bool shouldUseVideoAudio() const;
     bool shouldEnableCaptureAudio() const;
+    void applySourceDimensions(std::uint32_t width, std::uint32_t height);
+    bool resizeWindowToClient(int width, int height);
+    void updateWindowResizeMode();
+    bool applyLockedWindowSize(MINMAXINFO* info) const;
+    RECT computeVideoViewport(const RECT& clientRect, bool& valid) const;
+    bool uploadLatestFrame();
+    void renderFrame(bool forcePresent);
+    void setAudioPlaybackEnabled(bool enabled);
+    void setMicrophoneCaptureEnabled(bool enabled);
+    void setInputCaptureEnabled(bool enabled);
+    void selectVideoDevice(const std::string& moniker);
+    void selectAudioDevice(const std::string& moniker);
+    void selectMicrophoneDevice(const std::string& endpointId);
+    void setVideoAllowResizing(bool enabled);
+    void setVideoAspectMode(VideoAspectMode mode);
+    void requestImmediateRender();
+    HWND hwnd() const { return hwnd_; }
+    AppSettings& settings() { return settings_; }
+    const AppSettings& settings() const { return settings_; }
 
     HWND hwnd_ = nullptr;
     D3DRenderer renderer_;
@@ -72,12 +90,19 @@ private:
     InputCaptureManager inputCaptureManager_{serialStreamer_};
     MicrophoneCapture microphoneCapture_;
     AudioPlayback audioPlayback_;
+    OverlayUI overlay_;
 
     SettingsManager settingsManager_;
     AppSettings settings_{};
     unsigned int menuHotkeyId_ = 1;
-    std::unordered_map<unsigned int, std::string> videoCommandMap_;
-    std::unordered_map<unsigned int, std::string> audioCommandMap_;
-    std::unordered_map<unsigned int, std::string> microphoneCommandMap_;
     DWORD ignoreMenuHotkeyUntil_ = 0;
+    bool menuHotkeyRegistered_ = false;
+    std::atomic<std::uint32_t> pendingSourceWidth_{0};
+    std::atomic<std::uint32_t> pendingSourceHeight_{0};
+    std::atomic<bool> sourceChangePending_{false};
+    std::atomic<std::uint32_t> currentSourceWidth_{0};
+    std::atomic<std::uint32_t> currentSourceHeight_{0};
+    int lockedClientWidth_ = 0;
+    int lockedClientHeight_ = 0;
+    std::atomic<bool> forceRender_{false};
 };

@@ -388,7 +388,7 @@ bool D3DRenderer::ensureFrameResources(std::uint32_t width,
             return false;
         }
 
-        device_->CreateShaderResourceView(frameTexture_.Get(), nullptr, srvHandleCpu_);
+        device_->CreateShaderResourceView(frameTexture_.Get(), nullptr, srvHandleFrameCpu_);
 
         std::uint64_t totalBytes = 0;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -532,7 +532,7 @@ void D3DRenderer::uploadFrame(const void* data,
     loggedGpuPixels_ = false;
 }
 
-void D3DRenderer::render()
+void D3DRenderer::render(const std::function<void(ID3D12GraphicsCommandList*)>& overlayCallback)
 {
     if (!swapChain_ || !commandQueue_ || !commandList_)
     {
@@ -660,7 +660,7 @@ void D3DRenderer::render()
 
     ID3D12DescriptorHeap* heaps[] = {srvHeap_.Get(), samplerHeap_.Get()};
     commandList_->SetDescriptorHeaps(static_cast<UINT>(std::size(heaps)), heaps);
-    commandList_->SetGraphicsRootDescriptorTable(0, srvHandleGpu_);
+    commandList_->SetGraphicsRootDescriptorTable(0, srvHandleFrameGpu_);
     commandList_->SetGraphicsRootDescriptorTable(1, samplerHandleGpu_);
 
     commandList_->RSSetViewports(1, &viewport_);
@@ -670,6 +670,14 @@ void D3DRenderer::render()
     commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
     commandList_->IASetIndexBuffer(&indexBufferView_);
     commandList_->DrawIndexedInstanced(static_cast<UINT>(kIndices.size()), 1, 0, 0, 0);
+
+    if (overlayCallback)
+    {
+        ID3D12DescriptorHeap* overlayHeaps[] = {srvHeap_.Get()};
+        commandList_->SetDescriptorHeaps(1, overlayHeaps);
+        overlayCallback(commandList_.Get());
+        commandList_->SetDescriptorHeaps(static_cast<UINT>(std::size(heaps)), heaps);
+    }
 
     D3D12_RESOURCE_BARRIER toPresent{};
     toPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -937,7 +945,7 @@ bool D3DRenderer::createPipelineResources()
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
-    srvDesc.NumDescriptors = 1;
+    srvDesc.NumDescriptors = 2;
     srvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device_->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(srvHeap_.GetAddressOf()))))
@@ -945,8 +953,13 @@ bool D3DRenderer::createPipelineResources()
         logMessage("[Renderer] CreateDescriptorHeap SRV failed");
         return false;
     }
-    srvHandleCpu_ = srvHeap_->GetCPUDescriptorHandleForHeapStart();
-    srvHandleGpu_ = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    srvDescriptorSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    srvHandleFrameCpu_ = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+    srvHandleFrameGpu_ = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    srvHandleImGuiCpu_ = srvHandleFrameCpu_;
+    srvHandleImGuiCpu_.ptr += srvDescriptorSize_;
+    srvHandleImGuiGpu_ = srvHandleFrameGpu_;
+    srvHandleImGuiGpu_.ptr += srvDescriptorSize_;
 
     D3D12_DESCRIPTOR_HEAP_DESC samplerDesc{};
     samplerDesc.NumDescriptors = 1;
@@ -1315,4 +1328,38 @@ void D3DRenderer::updateViewport(UINT width, UINT height)
     scissorRect_.top = 0;
     scissorRect_.right = width != 0 ? static_cast<LONG>(width) : 1;
     scissorRect_.bottom = height != 0 ? static_cast<LONG>(height) : 1;
+}
+
+void D3DRenderer::setViewportRect(float x, float y, float width, float height)
+{
+    if (!swapChain_ || backBufferWidth_ == 0 || backBufferHeight_ == 0)
+    {
+        updateViewport(backBufferWidth_, backBufferHeight_);
+        return;
+    }
+
+    if (width <= 0.0f || height <= 0.0f)
+    {
+        updateViewport(backBufferWidth_, backBufferHeight_);
+        return;
+    }
+
+    viewport_.TopLeftX = x;
+    viewport_.TopLeftY = y;
+    viewport_.Width = width;
+    viewport_.Height = height;
+    viewport_.MinDepth = 0.0f;
+    viewport_.MaxDepth = 1.0f;
+
+    const auto clampLong = [](long value, long minVal, long maxVal) {
+        return std::min(std::max(value, minVal), maxVal);
+    };
+
+    const long right = static_cast<long>(std::ceil(x + width));
+    const long bottom = static_cast<long>(std::ceil(y + height));
+
+    scissorRect_.left = clampLong(static_cast<long>(std::floor(x)), 0, static_cast<long>(backBufferWidth_));
+    scissorRect_.top = clampLong(static_cast<long>(std::floor(y)), 0, static_cast<long>(backBufferHeight_));
+    scissorRect_.right = clampLong(right, 0, static_cast<long>(backBufferWidth_));
+    scissorRect_.bottom = clampLong(bottom, 0, static_cast<long>(backBufferHeight_));
 }

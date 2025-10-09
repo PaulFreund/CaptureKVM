@@ -32,6 +32,29 @@ namespace
     {
         return static_cast<std::int8_t>(std::clamp(value, kMouseDeltaMin, kMouseDeltaMax));
     }
+
+    constexpr UINT kMenuHotkeyVirtualKey = 'M';
+
+    bool isMenuModifierKey(UINT vk)
+    {
+        switch (vk)
+        {
+        case VK_CONTROL:
+        case VK_LCONTROL:
+        case VK_RCONTROL:
+        case VK_MENU:
+        case VK_LMENU:
+        case VK_RMENU:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool isMenuChordKey(UINT vk)
+    {
+        return (vk == kMenuHotkeyVirtualKey) || isMenuModifierKey(vk);
+    }
 }
 
 InputCaptureManager* InputCaptureManager::instance_ = nullptr;
@@ -57,10 +80,9 @@ void InputCaptureManager::setEnabled(bool enabled)
         activeKeys_.clear();
         keyboardOverflow_ = false;
         hasLastMousePoint_ = false;
-        pageUp_ = false;
-        home_ = false;
         menuChordLatched_ = false;
         skipNextRelativeEvent_ = false;
+        menuChordEnabled_.store(false, std::memory_order_release);
         installHooks();
     }
     else if (!enabled && current)
@@ -68,10 +90,9 @@ void InputCaptureManager::setEnabled(bool enabled)
         enabled_.store(false, std::memory_order_release);
         stopRelativeCapture(false);
         removeHooks();
-        pageUp_ = false;
-        home_ = false;
         menuChordLatched_ = false;
         skipNextRelativeEvent_ = false;
+        menuChordEnabled_.store(false, std::memory_order_release);
         requestCursorClip(false);
     }
 }
@@ -103,6 +124,11 @@ void InputCaptureManager::setAbsoluteMode(bool absolute)
     logInput(std::string("[Input] Mouse mode -> ") + (absolute ? "absolute" : "relative"));
 }
 
+void InputCaptureManager::setMenuChordEnabled(bool enabled)
+{
+    menuChordEnabled_.store(enabled, std::memory_order_release);
+}
+
 void InputCaptureManager::setCaptureRegion(const RECT& screenRect, bool valid)
 {
     bool changed = false;
@@ -123,6 +149,10 @@ void InputCaptureManager::setCaptureRegion(const RECT& screenRect, bool valid)
 
         captureBounds_ = screenRect;
         captureBoundsValid_.store(valid, std::memory_order_release);
+        if (!valid)
+        {
+            videoBoundsValid_.store(false, std::memory_order_release);
+        }
     }
     if (!valid)
     {
@@ -155,6 +185,29 @@ void InputCaptureManager::setTargetResolution(int width, int height)
 
     targetWidth_.store(width, std::memory_order_release);
     targetHeight_.store(height, std::memory_order_release);
+}
+
+void InputCaptureManager::setVideoViewport(const RECT& viewport, bool valid)
+{
+    std::lock_guard<std::mutex> lock(boundsMutex_);
+    videoBounds_ = viewport;
+    videoBoundsValid_.store(valid, std::memory_order_release);
+}
+
+bool InputCaptureManager::getVideoBounds(RECT& rect) const
+{
+    if (!videoBoundsValid_.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(boundsMutex_);
+    if (!videoBoundsValid_.load(std::memory_order_relaxed))
+    {
+        return false;
+    }
+    rect = videoBounds_;
+    return true;
 }
 
 void InputCaptureManager::requestCursorUncapture()
@@ -309,14 +362,16 @@ LRESULT CALLBACK InputCaptureManager::keyboardProc(int code, WPARAM wParam, LPAR
     if (self && self->enabled_.load(std::memory_order_acquire))
     {
         const bool within = self->shouldConsumeKeyboard(*data);
-        const bool isChordKey = (data->vkCode == VK_PRIOR) || (data->vkCode == VK_NEXT) || (data->vkCode == VK_HOME);
+        const UINT vkCode = static_cast<UINT>(data->vkCode);
+        const bool chordEnabled = self->menuChordEnabled_.load(std::memory_order_acquire);
+        const bool isChordKey = chordEnabled && isMenuChordKey(vkCode);
 
         if (within || isChordKey)
         {
             self->handleKeyboardEvent(wParam, *data);
         }
 
-        const bool menuChordActive = self->pageUp_ && self->home_;
+        const bool menuChordActive = self->menuChordLatched_;
         const bool allowChordKey = isChordKey && menuChordActive;
         const bool allowThrough = !within || allowChordKey;
 
@@ -398,9 +453,10 @@ void InputCaptureManager::handleKeyboardEvent(WPARAM wParam, const KBDLLHOOKSTRU
 
     const UINT vk = static_cast<UINT>(data.vkCode);
     const bool extended = (data.flags & LLKHF_EXTENDED) != 0;
-    const bool isChordKey = (vk == VK_PRIOR) || (vk == VK_NEXT) || (vk == VK_HOME);
+    const bool chordEnabled = menuChordEnabled_.load(std::memory_order_acquire);
+    const bool chordCandidate = chordEnabled && isMenuChordKey(vk);
 
-    if (!isChordKey)
+    if (!chordCandidate)
     {
         POINT cursor{};
         if (!GetCursorPos(&cursor) || !isWithinCaptureBounds(cursor))
@@ -411,24 +467,49 @@ void InputCaptureManager::handleKeyboardEvent(WPARAM wParam, const KBDLLHOOKSTRU
 
     updateModifierState(vk, data.scanCode, extended, keyDown);
 
-    const bool menuChord = pageUp_ && home_;
-    if (menuChord && !menuChordLatched_ && keyDown)
+    const bool ctrlActive = leftCtrl_ || rightCtrl_;
+    const bool altActive = leftAlt_ || rightAlt_;
+    const bool menuChord = chordEnabled && ctrlActive && altActive;
+    const bool isMenuKey = chordEnabled && (vk == kMenuHotkeyVirtualKey);
+
+    if (isMenuKey)
     {
-        menuChordLatched_ = true;
-        HWND target = targetWindow_.load(std::memory_order_acquire);
-        if (target)
+        if (menuChord && keyDown)
         {
-            PostMessage(target, WM_INPUT_CAPTURE_SHOW_MENU, 0, 0);
-            PostMessage(target, WM_INPUT_CAPTURE_UPDATE_CLIP, 0, 0);
+            if (!menuChordLatched_)
+            {
+                menuChordLatched_ = true;
+                HWND target = targetWindow_.load(std::memory_order_acquire);
+                if (target)
+                {
+                    PostMessage(target, WM_INPUT_CAPTURE_SHOW_MENU, 0, 0);
+                    PostMessage(target, WM_INPUT_CAPTURE_UPDATE_CLIP, 0, 0);
+                }
+            }
+            return;
+        }
+
+        if (menuChordLatched_)
+        {
+            if (keyUp || !menuChord)
+            {
+                menuChordLatched_ = false;
+                if (relativeCaptureActive_.load(std::memory_order_acquire))
+                {
+                    requestCursorClip(true);
+                }
+            }
+            return;
         }
     }
-    else if (!menuChord && !keyDown)
+    else if (menuChordLatched_ && chordEnabled && !menuChord && keyUp && isMenuModifierKey(vk))
     {
         menuChordLatched_ = false;
         if (relativeCaptureActive_.load(std::memory_order_acquire))
         {
             requestCursorClip(true);
         }
+        // fall through so releases reach the remote endpoint
     }
 
     if (!isModifierVirtualKey(vk))
@@ -500,8 +581,6 @@ void InputCaptureManager::updateModifierState(UINT vk, UINT scanCode, bool exten
     case VK_RMENU: rightAlt_ = keyDown; break;
     case VK_LWIN: leftWin_ = keyDown; break;
     case VK_RWIN: rightWin_ = keyDown; break;
-    case VK_PRIOR: pageUp_ = keyDown; break;
-    case VK_HOME: home_ = keyDown; break;
     default:
         break;
     }
@@ -530,11 +609,6 @@ void InputCaptureManager::handleMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT& 
     if (absoluteMode)
     {
         stopRelativeCapture(false);
-        if (!hasLastMousePoint_)
-        {
-            lastMousePoint_ = data.pt;
-            hasLastMousePoint_ = true;
-        }
     }
 
     if (!absoluteMode)
@@ -569,58 +643,21 @@ void InputCaptureManager::handleMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT& 
         pan = clampInt8(steps);
     }
 
-    std::uint8_t buttons = 0;
-    if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) buttons |= 0x01;
-    if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) buttons |= 0x02;
-    if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) buttons |= 0x04;
-    if (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) buttons |= 0x08;
-    if (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) buttons |= 0x10;
+    updateMouseButtonState(wParam, data);
+    std::uint8_t buttons = currentMouseButtonBits();
 
     if (absoluteMode)
     {
-        RECT bounds{};
-        if (!getCaptureBounds(bounds))
+        if (sendAbsoluteMouseState(data.pt, buttons, wheel, pan))
         {
-            return;
+            lastMousePoint_ = data.pt;
+            hasLastMousePoint_ = true;
         }
-
-        const long width = std::max<long>(bounds.right - bounds.left, 1);
-        const long height = std::max<long>(bounds.bottom - bounds.top, 1);
-
-        const long clampedX = std::clamp<long>(data.pt.x - bounds.left, 0, width - 1);
-        const long clampedY = std::clamp<long>(data.pt.y - bounds.top, 0, height - 1);
-
-        int targetW = targetWidth_.load(std::memory_order_acquire);
-        int targetH = targetHeight_.load(std::memory_order_acquire);
-        if (targetW <= 0)
+        else
         {
-            targetW = width;
+            hasLastMousePoint_ = false;
         }
-        if (targetH <= 0)
-        {
-            targetH = height;
-        }
-
-        const long scaledX = (width > 1) ? (clampedX * static_cast<long long>(targetW - 1) / std::max<long>(width - 1, 1)) : 0;
-        const long scaledY = (height > 1) ? (clampedY * static_cast<long long>(targetH - 1) / std::max<long>(height - 1, 1)) : 0;
-
-        constexpr std::uint16_t kAbsoluteMax = static_cast<std::uint16_t>(std::numeric_limits<short>::max()); // 32767
-        const double normX = (targetW > 1) ? static_cast<double>(scaledX) / static_cast<double>(targetW - 1) : 0.0;
-        const double normY = (targetH > 1) ? static_cast<double>(scaledY) / static_cast<double>(targetH - 1) : 0.0;
-
-        const std::uint16_t absX = static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(std::lround(normX * kAbsoluteMax)), 0, kAbsoluteMax));
-        const std::uint16_t absY = static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(std::lround(normY * kAbsoluteMax)), 0, kAbsoluteMax));
-
-        std::array<std::uint8_t, 7> report{};
-        report[0] = static_cast<std::uint8_t>(buttons & 0x1F);
-        report[1] = static_cast<std::uint8_t>((absX >> 8) & 0xFF);
-        report[2] = static_cast<std::uint8_t>(absX & 0xFF);
-        report[3] = static_cast<std::uint8_t>((absY >> 8) & 0xFF);
-        report[4] = static_cast<std::uint8_t>(absY & 0xFF);
-        report[5] = static_cast<std::uint8_t>(wheel);
-        report[6] = static_cast<std::uint8_t>(pan);
-
-        streamer_.publishMouseAbsoluteReport(report);
+        return;
     }
     else
     {
@@ -746,12 +783,158 @@ void InputCaptureManager::resetKeyboardState()
     keyboardOverflow_ = false;
     leftCtrl_ = rightCtrl_ = leftShift_ = rightShift_ = false;
     leftAlt_ = rightAlt_ = leftWin_ = rightWin_ = false;
-    pageUp_ = false;
-    home_ = false;
     menuChordLatched_ = false;
     skipNextRelativeEvent_ = false;
+    leftButtonDown_ = rightButtonDown_ = middleButtonDown_ = false;
+    xButton1Down_ = xButton2Down_ = false;
     std::array<std::uint8_t, 8> report{};
     streamer_.publishKeyboardReport(report);
+}
+
+void InputCaptureManager::clearModifierState()
+{
+    const bool hadButtons = leftButtonDown_ || rightButtonDown_ || middleButtonDown_ || xButton1Down_ || xButton2Down_;
+
+    leftCtrl_ = rightCtrl_ = leftShift_ = rightShift_ = false;
+    leftAlt_ = rightAlt_ = leftWin_ = rightWin_ = false;
+    menuChordLatched_ = false;
+    leftButtonDown_ = rightButtonDown_ = middleButtonDown_ = false;
+    xButton1Down_ = xButton2Down_ = false;
+    sendKeyboardReport();
+
+    if (hadButtons)
+    {
+        if (absoluteMode_.load(std::memory_order_acquire) && hasLastMousePoint_)
+        {
+            (void)sendAbsoluteMouseState(lastMousePoint_, 0, 0, 0);
+        }
+        else if (!absoluteMode_.load(std::memory_order_acquire) && relativeCaptureActive_.load(std::memory_order_acquire))
+        {
+            std::array<std::uint8_t, 5> report{};
+            streamer_.publishMouseReport(report);
+        }
+    }
+}
+
+void InputCaptureManager::updateMouseButtonState(WPARAM wParam, const MSLLHOOKSTRUCT& data)
+{
+    switch (wParam)
+    {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        leftButtonDown_ = true;
+        break;
+    case WM_LBUTTONUP:
+        leftButtonDown_ = false;
+        break;
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONDBLCLK:
+        rightButtonDown_ = true;
+        break;
+    case WM_RBUTTONUP:
+        rightButtonDown_ = false;
+        break;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDBLCLK:
+        middleButtonDown_ = true;
+        break;
+    case WM_MBUTTONUP:
+        middleButtonDown_ = false;
+        break;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+    {
+        const WORD buttonFlags = HIWORD(data.mouseData);
+        const bool pressed = (wParam == WM_XBUTTONDOWN) || (wParam == WM_XBUTTONDBLCLK);
+        if (buttonFlags & XBUTTON1)
+        {
+            xButton1Down_ = pressed;
+        }
+        if (buttonFlags & XBUTTON2)
+        {
+            xButton2Down_ = pressed;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+std::uint8_t InputCaptureManager::currentMouseButtonBits() const
+{
+    std::uint8_t bits = 0;
+    if (leftButtonDown_) bits |= 0x01;
+    if (rightButtonDown_) bits |= 0x02;
+    if (middleButtonDown_) bits |= 0x04;
+    if (xButton1Down_) bits |= 0x08;
+    if (xButton2Down_) bits |= 0x10;
+    return bits;
+}
+
+bool InputCaptureManager::sendAbsoluteMouseState(POINT point, std::uint8_t buttons, std::int8_t wheel, std::int8_t pan)
+{
+    RECT bounds{};
+    if (!getCaptureBounds(bounds))
+    {
+        return false;
+    }
+
+    RECT videoBounds{};
+    bool haveVideoBounds = getVideoBounds(videoBounds);
+    if (!haveVideoBounds)
+    {
+        videoBounds = bounds;
+    }
+
+    if (haveVideoBounds)
+    {
+        if (point.x < videoBounds.left || point.x >= videoBounds.right ||
+            point.y < videoBounds.top || point.y >= videoBounds.bottom)
+        {
+            return false;
+        }
+    }
+
+    const long width = std::max<long>(videoBounds.right - videoBounds.left, 1);
+    const long height = std::max<long>(videoBounds.bottom - videoBounds.top, 1);
+
+    const long clampedX = std::clamp<long>(point.x - videoBounds.left, 0, width - 1);
+    const long clampedY = std::clamp<long>(point.y - videoBounds.top, 0, height - 1);
+
+    int targetW = targetWidth_.load(std::memory_order_acquire);
+    int targetH = targetHeight_.load(std::memory_order_acquire);
+    if (targetW <= 0)
+    {
+        targetW = width;
+    }
+    if (targetH <= 0)
+    {
+        targetH = height;
+    }
+
+    const long scaledX = (width > 1) ? (clampedX * static_cast<long long>(targetW - 1) / std::max<long>(width - 1, 1)) : 0;
+    const long scaledY = (height > 1) ? (clampedY * static_cast<long long>(targetH - 1) / std::max<long>(height - 1, 1)) : 0;
+
+    constexpr std::uint16_t kAbsoluteMax = static_cast<std::uint16_t>(std::numeric_limits<short>::max()); // 32767
+    const double normX = (targetW > 1) ? static_cast<double>(scaledX) / static_cast<double>(targetW - 1) : 0.0;
+    const double normY = (targetH > 1) ? static_cast<double>(scaledY) / static_cast<double>(targetH - 1) : 0.0;
+
+    const std::uint16_t absX = static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(std::lround(normX * kAbsoluteMax)), 0, kAbsoluteMax));
+    const std::uint16_t absY = static_cast<std::uint16_t>(std::clamp<long>(static_cast<long>(std::lround(normY * kAbsoluteMax)), 0, kAbsoluteMax));
+
+    std::array<std::uint8_t, 7> report{};
+    report[0] = static_cast<std::uint8_t>(buttons & 0x1F);
+    report[1] = static_cast<std::uint8_t>((absX >> 8) & 0xFF);
+    report[2] = static_cast<std::uint8_t>(absX & 0xFF);
+    report[3] = static_cast<std::uint8_t>((absY >> 8) & 0xFF);
+    report[4] = static_cast<std::uint8_t>(absY & 0xFF);
+    report[5] = static_cast<std::uint8_t>(wheel);
+    report[6] = static_cast<std::uint8_t>(pan);
+
+    streamer_.publishMouseAbsoluteReport(report);
+    return true;
 }
 
 bool InputCaptureManager::isModifierVirtualKey(UINT vk)
