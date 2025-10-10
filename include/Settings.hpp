@@ -30,6 +30,8 @@ struct AppSettings {
     bool mouseAbsoluteMode = true;
     std::string inputTargetDevice;
     unsigned int serialBaudRate = 6000000;
+    unsigned int videoPreferredWidth = 0;
+    unsigned int videoPreferredHeight = 0;
     bool videoAllowResizing = true;
     VideoAspectMode videoAspectMode = VideoAspectMode::Maintain;
     HotkeyConfig menuHotkey;

@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <string_view>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -211,6 +213,20 @@ void OverlayUI::refreshDeviceLists(Application& app)
             app.selectBridgeDevice(option.port, true);
         }
     }
+
+    refreshVideoModes(app);
+}
+
+void OverlayUI::refreshVideoModes(Application& app)
+{
+    videoModes_.clear();
+    const std::string& moniker = app.settings().videoDeviceMoniker;
+    if (moniker.empty())
+    {
+        return;
+    }
+
+    videoModes_ = enumerateVideoModes(moniker);
 }
 
 void OverlayUI::drawMenuWindow(Application& app)
@@ -371,10 +387,64 @@ void OverlayUI::drawMenuWindow(Application& app)
             if (ImGui::Selectable(label.c_str(), selected))
             {
                 app.selectVideoDevice(device.monikerDisplayName);
+                refreshVideoModes(app);
             }
         }
     }
     ImGui::EndChild();
+
+    ImGui::Spacing();
+
+    std::string resolutionLabel;
+    if (app.settings().videoPreferredWidth == 0 || app.settings().videoPreferredHeight == 0)
+    {
+        resolutionLabel = "Auto (driver default)";
+    }
+    else
+    {
+        resolutionLabel = std::to_string(app.settings().videoPreferredWidth) + "x" + std::to_string(app.settings().videoPreferredHeight);
+    }
+
+    if (ImGui::BeginCombo("Capture Resolution", resolutionLabel.c_str()))
+    {
+        const bool autoSelected = app.settings().videoPreferredWidth == 0 || app.settings().videoPreferredHeight == 0;
+        if (ImGui::Selectable("Auto (driver default)", autoSelected))
+        {
+            app.setVideoResolution(0, 0);
+        }
+
+        for (const auto& mode : videoModes_)
+        {
+            std::ostringstream oss;
+            oss << mode.width << "x" << mode.height;
+            if (mode.frameRate > 0.0)
+            {
+                oss << " @" << std::fixed << std::setprecision(2) << mode.frameRate << " Hz";
+            }
+            const std::string modeLabel = oss.str();
+            const bool selected = app.settings().videoPreferredWidth == mode.width &&
+                                  app.settings().videoPreferredHeight == mode.height;
+            if (ImGui::Selectable(modeLabel.c_str(), selected))
+            {
+                app.setVideoResolution(mode.width, mode.height);
+            }
+        }
+
+        ImGui::EndCombo();
+    }
+
+    ImGui::Spacing();
+
+    const std::uint32_t signalWidth = app.currentCaptureWidth();
+    const std::uint32_t signalHeight = app.currentCaptureHeight();
+    if (signalWidth != 0 && signalHeight != 0)
+    {
+        ImGui::Text("Current Signal: %ux%u", signalWidth, signalHeight);
+    }
+    else
+    {
+        ImGui::TextDisabled("Current Signal: awaiting frames");
+    }
 
     ImGui::Spacing();
 

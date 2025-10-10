@@ -9,7 +9,10 @@
 #include <wrl/client.h>
 #include <winreg.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -70,6 +73,37 @@ namespace
             return {};
         }
         return wideToUtf8(std::wstring(value, SysStringLen(value)));
+    }
+
+    std::wstring utf8ToWide(const std::string& input)
+    {
+        if (input.empty())
+        {
+            return {};
+        }
+        const int required = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0);
+        if (required <= 0)
+        {
+            return {};
+        }
+        std::wstring result(static_cast<std::size_t>(required), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), result.data(), required);
+        return result;
+    }
+
+    void freeMediaType(AM_MEDIA_TYPE& mt)
+    {
+        if (mt.cbFormat != 0 && mt.pbFormat)
+        {
+            CoTaskMemFree(mt.pbFormat);
+            mt.cbFormat = 0;
+            mt.pbFormat = nullptr;
+        }
+        if (mt.pUnk)
+        {
+            mt.pUnk->Release();
+            mt.pUnk = nullptr;
+        }
     }
 
     template <typename DeviceInfo>
@@ -273,4 +307,145 @@ std::vector<SerialPortInfo> enumerateSerialPorts()
 
     SetupDiDestroyDeviceInfoList(deviceInfo);
     return ports;
+}
+
+std::vector<VideoModeInfo> enumerateVideoModes(const std::string& monikerDisplayName)
+{
+    std::vector<VideoModeInfo> modes;
+    if (monikerDisplayName.empty())
+    {
+        return modes;
+    }
+
+    ScopedCoInit coInit(COINIT_MULTITHREADED);
+
+    ComPtr<IGraphBuilder> graph;
+    if (FAILED(CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&graph))))
+    {
+        return modes;
+    }
+
+    ComPtr<ICaptureGraphBuilder2> builder;
+    if (FAILED(CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&builder))))
+    {
+        return modes;
+    }
+
+    if (FAILED(builder->SetFiltergraph(graph.Get())))
+    {
+        return modes;
+    }
+
+    const std::wstring monikerWide = utf8ToWide(monikerDisplayName);
+    if (monikerWide.empty())
+    {
+        return modes;
+    }
+
+    ComPtr<IBindCtx> bindCtx;
+    if (FAILED(CreateBindCtx(0, &bindCtx)))
+    {
+        return modes;
+    }
+
+    ULONG eaten = 0;
+    ComPtr<IMoniker> moniker;
+    if (FAILED(MkParseDisplayName(bindCtx.Get(), monikerWide.c_str(), &eaten, moniker.GetAddressOf())) || !moniker)
+    {
+        return modes;
+    }
+
+    ComPtr<IBaseFilter> captureFilter;
+    if (FAILED(moniker->BindToObject(nullptr, nullptr, IID_PPV_ARGS(&captureFilter))) || !captureFilter)
+    {
+        return modes;
+    }
+
+    if (FAILED(graph->AddFilter(captureFilter.Get(), L"Source")))
+    {
+        return modes;
+    }
+
+    ComPtr<IAMStreamConfig> streamConfig;
+    HRESULT hr = builder->FindInterface(&PIN_CATEGORY_CAPTURE,
+                                        &MEDIATYPE_Video,
+                                        captureFilter.Get(),
+                                        IID_PPV_ARGS(streamConfig.GetAddressOf()));
+    if (FAILED(hr) || !streamConfig)
+    {
+        hr = builder->FindInterface(&PIN_CATEGORY_PREVIEW,
+                                     &MEDIATYPE_Video,
+                                     captureFilter.Get(),
+                                     IID_PPV_ARGS(streamConfig.GetAddressOf()));
+    }
+
+    if (FAILED(hr) || !streamConfig)
+    {
+        return modes;
+    }
+
+    int capabilityCount = 0;
+    int capabilitySize = 0;
+    if (FAILED(streamConfig->GetNumberOfCapabilities(&capabilityCount, &capabilitySize)) || capabilityCount <= 0 || capabilitySize <= 0)
+    {
+        return modes;
+    }
+
+    std::vector<std::uint8_t> capabilityBuffer(static_cast<std::size_t>(capabilitySize));
+    std::map<std::pair<std::uint32_t, std::uint32_t>, double> uniqueModes;
+
+    for (int i = 0; i < capabilityCount; ++i)
+    {
+        AM_MEDIA_TYPE* mediaType = nullptr;
+        if (FAILED(streamConfig->GetStreamCaps(i, &mediaType, capabilityBuffer.data())) || !mediaType)
+        {
+            continue;
+        }
+
+        if (mediaType->formattype == FORMAT_VideoInfo && mediaType->cbFormat >= sizeof(VIDEOINFOHEADER) && mediaType->pbFormat)
+        {
+            const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(mediaType->pbFormat);
+            const std::uint32_t width = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biWidth));
+            const std::uint32_t height = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biHeight));
+            double frameRate = 0.0;
+            if (vih->AvgTimePerFrame > 0)
+            {
+                frameRate = 10'000'000.0 / static_cast<double>(vih->AvgTimePerFrame);
+            }
+
+            auto key = std::make_pair(width, height);
+            auto existing = uniqueModes.find(key);
+            if (existing == uniqueModes.end() || frameRate > existing->second)
+            {
+                uniqueModes[key] = frameRate;
+            }
+        }
+
+        freeMediaType(*mediaType);
+        CoTaskMemFree(mediaType);
+    }
+
+    modes.reserve(uniqueModes.size());
+    for (const auto& entry : uniqueModes)
+    {
+        VideoModeInfo mode;
+        mode.width = entry.first.first;
+        mode.height = entry.first.second;
+        mode.frameRate = entry.second;
+        modes.push_back(mode);
+    }
+
+    std::sort(modes.begin(), modes.end(), [](const VideoModeInfo& a, const VideoModeInfo& b) {
+        if (a.width != b.width)
+        {
+            return a.width > b.width;
+        }
+        if (a.height != b.height)
+        {
+            return a.height > b.height;
+        }
+        return a.frameRate > b.frameRate;
+    });
+
+    return modes;
 }

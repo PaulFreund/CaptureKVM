@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,14 @@ struct SerialPortInfo {
     std::vector<std::string> hardwareIds;
 };
 
+struct VideoModeInfo {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    double frameRate = 0.0;
+};
+
 std::vector<VideoDeviceInfo> enumerateVideoCaptureDevices();
 std::vector<AudioCaptureDeviceInfo> enumerateAudioCaptureDevices();
 std::vector<MicrophoneDeviceInfo> enumerateMicrophoneDevices();
 std::vector<SerialPortInfo> enumerateSerialPorts();
+std::vector<VideoModeInfo> enumerateVideoModes(const std::string& monikerDisplayName);

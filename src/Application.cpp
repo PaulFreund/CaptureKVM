@@ -114,6 +114,8 @@ int Application::run()
         DirectShowCapture::Options captureOptions;
         captureOptions.deviceMoniker = settings_.videoDeviceMoniker;
         captureOptions.enableAudio = audioEnabled_;
+        captureOptions.desiredWidth = settings_.videoPreferredWidth;
+        captureOptions.desiredHeight = settings_.videoPreferredHeight;
 
         directShowCapture_.start([this](const DirectShowCapture::Frame& frame) {
             handleFrame(frame);
@@ -437,74 +439,296 @@ void Application::handleFrame(const DirectShowCapture::Frame& frame)
     CpuFrame& dst = frames_[backIndex];
 
     dst.timestamp100ns = frame.timestamp100ns;
-    dst.width = frame.width;
-    dst.height = frame.height;
 
-    const std::uint32_t frameWidth = frame.width;
-    const std::uint32_t frameHeight = frame.height;
+    constexpr std::uint32_t bytesPerPixel = 4;
+    const std::uint32_t sampleStride = frame.stride != 0
+        ? frame.stride
+        : (frame.sampleWidth != 0 ? frame.sampleWidth * bytesPerPixel : frame.width * bytesPerPixel);
+    const std::uint32_t sampleWidth = frame.sampleWidth != 0
+        ? frame.sampleWidth
+        : (sampleStride != 0 ? sampleStride / bytesPerPixel : frame.width);
+    const std::uint32_t sampleHeight = frame.sampleHeight != 0 ? frame.sampleHeight : frame.height;
+
+    const std::uint8_t* srcRows = static_cast<const std::uint8_t*>(frame.data);
+
+    auto clampValue = [](std::uint32_t value, std::uint32_t minValue, std::uint32_t maxValue) {
+        return std::max(minValue, std::min(value, maxValue));
+    };
+
+    auto brightnessAt = [&](std::uint32_t x, std::uint32_t y) -> std::uint8_t {
+        if (!srcRows || x >= sampleWidth || y >= sampleHeight)
+        {
+            return 0;
+        }
+        const std::uint32_t srcY = frame.bottomUp ? (sampleHeight - 1u - y) : y;
+        const std::size_t rowOffset = static_cast<std::size_t>(srcY) * sampleStride;
+        const std::size_t pixelOffset = static_cast<std::size_t>(x) * bytesPerPixel;
+        const std::size_t required = rowOffset + pixelOffset + (bytesPerPixel - 1u);
+        if (required >= frame.dataSize)
+        {
+            return 0;
+        }
+        const std::uint8_t* px = srcRows + rowOffset + pixelOffset;
+        return std::max({px[0], px[1], px[2]});
+    };
+
+    auto detectActiveRegion = [&](std::uint32_t& left,
+                                  std::uint32_t& top,
+                                  std::uint32_t& right,
+                                  std::uint32_t& bottom) -> bool {
+        if (!srcRows || sampleWidth == 0 || sampleHeight == 0)
+        {
+            return false;
+        }
+
+        const std::uint32_t stepX = std::max<std::uint32_t>(1, sampleWidth / 256u);
+        const std::uint32_t stepY = std::max<std::uint32_t>(1, sampleHeight / 256u);
+        constexpr std::uint8_t kIntensityThreshold = 16;
+        constexpr std::uint32_t kMinHits = 2;
+
+        std::uint32_t detectedTop = 0;
+        bool foundTop = false;
+        for (std::uint32_t y = 0; y < sampleHeight; ++y)
+        {
+            std::uint32_t hits = 0;
+            for (std::uint32_t x = 0; x < sampleWidth; x += stepX)
+            {
+                if (brightnessAt(x, y) > kIntensityThreshold)
+                {
+                    if (++hits >= kMinHits)
+                    {
+                        foundTop = true;
+                        detectedTop = y;
+                        break;
+                    }
+                }
+            }
+            if (foundTop)
+            {
+                break;
+            }
+        }
+        if (!foundTop)
+        {
+            return false;
+        }
+
+        std::uint32_t detectedBottom = sampleHeight - 1;
+        bool foundBottom = false;
+        for (std::uint32_t y = sampleHeight; y-- > detectedTop;)
+        {
+            std::uint32_t hits = 0;
+            for (std::uint32_t x = 0; x < sampleWidth; x += stepX)
+            {
+                if (brightnessAt(x, y) > kIntensityThreshold)
+                {
+                    if (++hits >= kMinHits)
+                    {
+                        foundBottom = true;
+                        detectedBottom = y;
+                        break;
+                    }
+                }
+            }
+            if (foundBottom)
+            {
+                break;
+            }
+        }
+        if (!foundBottom || detectedBottom <= detectedTop)
+        {
+            return false;
+        }
+
+        std::uint32_t detectedLeft = 0;
+        bool foundLeft = false;
+        for (std::uint32_t x = 0; x < sampleWidth; ++x)
+        {
+            std::uint32_t hits = 0;
+            for (std::uint32_t y = detectedTop; y <= detectedBottom; y += stepY)
+            {
+                if (brightnessAt(x, y) > kIntensityThreshold)
+                {
+                    if (++hits >= kMinHits)
+                    {
+                        foundLeft = true;
+                        detectedLeft = x;
+                        break;
+                    }
+                }
+            }
+            if (foundLeft)
+            {
+                break;
+            }
+        }
+        if (!foundLeft)
+        {
+            return false;
+        }
+
+        std::uint32_t detectedRight = sampleWidth - 1;
+        bool foundRight = false;
+        for (std::uint32_t x = sampleWidth; x-- > detectedLeft;)
+        {
+            std::uint32_t hits = 0;
+            for (std::uint32_t y = detectedTop; y <= detectedBottom; y += stepY)
+            {
+                if (brightnessAt(x, y) > kIntensityThreshold)
+                {
+                    if (++hits >= kMinHits)
+                    {
+                        foundRight = true;
+                        detectedRight = x;
+                        break;
+                    }
+                }
+            }
+            if (foundRight)
+            {
+                break;
+            }
+        }
+        if (!foundRight || detectedRight <= detectedLeft)
+        {
+            return false;
+        }
+
+        constexpr std::uint32_t kMargin = 2;
+        const std::uint32_t extendedLeft = detectedLeft > kMargin ? detectedLeft - kMargin : 0u;
+        const std::uint32_t extendedTop = detectedTop > kMargin ? detectedTop - kMargin : 0u;
+        const std::uint32_t extendedRight = std::min<std::uint32_t>(detectedRight + kMargin + 1u, sampleWidth);
+        const std::uint32_t extendedBottom = std::min<std::uint32_t>(detectedBottom + kMargin + 1u, sampleHeight);
+
+        left = clampValue(extendedLeft, 0u, sampleWidth > 0 ? sampleWidth - 1u : 0u);
+        top = clampValue(extendedTop, 0u, sampleHeight > 0 ? sampleHeight - 1u : 0u);
+        right = clampValue(extendedRight, left + 1u, sampleWidth);
+        bottom = clampValue(extendedBottom, top + 1u, sampleHeight);
+        return true;
+    };
+
+    std::uint32_t cropLeft = std::min(frame.contentLeft, sampleWidth);
+    std::uint32_t cropTop = std::min(frame.contentTop, sampleHeight);
+    std::uint32_t cropRight = frame.contentRight > cropLeft ? std::min(frame.contentRight, sampleWidth) : sampleWidth;
+    std::uint32_t cropBottom = frame.contentBottom > cropTop ? std::min(frame.contentBottom, sampleHeight) : sampleHeight;
+
+    const bool driverProvidedCrop = (cropLeft != 0 || cropTop != 0 || cropRight != sampleWidth || cropBottom != sampleHeight);
+    std::uint32_t detectedLeft = cropLeft;
+    std::uint32_t detectedTop = cropTop;
+    std::uint32_t detectedRight = cropRight;
+    std::uint32_t detectedBottom = cropBottom;
+    if (detectActiveRegion(detectedLeft, detectedTop, detectedRight, detectedBottom))
+    {
+        cropLeft = driverProvidedCrop ? std::max(cropLeft, detectedLeft) : detectedLeft;
+        cropTop = driverProvidedCrop ? std::max(cropTop, detectedTop) : detectedTop;
+        cropRight = driverProvidedCrop ? std::min(cropRight, detectedRight) : detectedRight;
+        cropBottom = driverProvidedCrop ? std::min(cropBottom, detectedBottom) : detectedBottom;
+        if (cropRight <= cropLeft)
+        {
+            cropRight = detectedRight;
+        }
+        if (cropBottom <= cropTop)
+        {
+            cropBottom = detectedBottom;
+        }
+    }
+
+    std::uint32_t contentWidth = cropRight > cropLeft ? (cropRight - cropLeft) : sampleWidth;
+    std::uint32_t contentHeight = cropBottom > cropTop ? (cropBottom - cropTop) : sampleHeight;
+
+    contentWidth = std::max<std::uint32_t>(1, std::min(contentWidth, sampleWidth));
+    contentHeight = std::max<std::uint32_t>(1, std::min(contentHeight, sampleHeight));
+
+    static std::atomic<bool> loggedAutoCrop{false};
+    if (!driverProvidedCrop && (cropLeft != 0 || cropTop != 0 || cropRight != sampleWidth || cropBottom != sampleHeight))
+    {
+        if (!loggedAutoCrop.exchange(true))
+        {
+            logApp("[App] Auto-detected active video region: left=" + std::to_string(cropLeft)
+                   + " top=" + std::to_string(cropTop)
+                   + " right=" + std::to_string(cropRight)
+                   + " bottom=" + std::to_string(cropBottom)
+                   + " (" + std::to_string(contentWidth) + "x" + std::to_string(contentHeight) + ")");
+        }
+    }
+
+    dst.width = contentWidth;
+    dst.height = contentHeight;
+
     const std::uint32_t knownWidth = currentSourceWidth_.load(std::memory_order_acquire);
     const std::uint32_t knownHeight = currentSourceHeight_.load(std::memory_order_acquire);
-    if (frameWidth != knownWidth || frameHeight != knownHeight)
+    if (contentWidth != knownWidth || contentHeight != knownHeight)
     {
-        pendingSourceWidth_.store(frameWidth, std::memory_order_release);
-        pendingSourceHeight_.store(frameHeight, std::memory_order_release);
+        pendingSourceWidth_.store(contentWidth, std::memory_order_release);
+        pendingSourceHeight_.store(contentHeight, std::memory_order_release);
         sourceChangePending_.store(true, std::memory_order_release);
     }
 
-    inputCaptureManager_.setTargetResolution(static_cast<int>(frame.width), static_cast<int>(frame.height));
+    inputCaptureManager_.setTargetResolution(static_cast<int>(contentWidth), static_cast<int>(contentHeight));
 
-    const std::uint32_t stride = frame.stride != 0 ? frame.stride : frame.width * 4;
-    const std::size_t requiredBytes = static_cast<std::size_t>(stride) * frame.height;
-    if (frame.dataSize < requiredBytes)
+    const std::size_t expectedSampleBytes = static_cast<std::size_t>(sampleStride) * sampleHeight;
+    if (frame.dataSize < expectedSampleBytes)
     {
-        logApp("[App] Warning: frame data shorter than expected (" + std::to_string(frame.dataSize) + " < " + std::to_string(requiredBytes) + ")");
+        logApp("[App] Warning: frame data shorter than expected (" + std::to_string(frame.dataSize) + " < " + std::to_string(expectedSampleBytes) + ")");
     }
-    dst.data.resize(requiredBytes);
+
+    const std::uint32_t dstStride = contentWidth * bytesPerPixel;
+    dst.stride = dstStride;
+    dst.data.resize(static_cast<std::size_t>(dstStride) * contentHeight);
 
     const bool bottomUp = frame.bottomUp;
 
     if (frame.data && frame.dataSize > 0)
     {
-        const auto* srcRows = static_cast<const std::uint8_t*>(frame.data);
-        auto* dstRows = dst.data.data();
-        const std::size_t strideSize = stride;
-        const std::size_t availableRows = strideSize != 0 ? std::min<std::size_t>(frame.height, frame.dataSize / strideSize) : 0;
+        std::size_t bytesWritten = 0;
 
-        if (!bottomUp)
+        for (std::uint32_t row = 0; row < contentHeight; ++row)
         {
-            for (std::size_t y = 0; y < availableRows; ++y)
+            const std::uint32_t imageRow = cropTop + row;
+            const std::uint32_t srcRowIndex = bottomUp
+                ? (imageRow < sampleHeight ? (sampleHeight - 1u - imageRow) : 0u)
+                : imageRow;
+
+            if (srcRowIndex >= sampleHeight)
             {
-                std::memcpy(dstRows + y * strideSize,
-                            srcRows + y * strideSize,
-                            strideSize);
+                break;
             }
-        }
-        else
-        {
-            for (std::size_t y = 0; y < availableRows; ++y)
+
+            const std::size_t srcOffset = static_cast<std::size_t>(srcRowIndex) * sampleStride;
+            if (srcOffset + sampleStride > frame.dataSize)
             {
-                const std::size_t srcIndex = frame.height - 1 - y;
-                if (srcIndex < availableRows)
-                {
-                    std::memcpy(dstRows + y * strideSize,
-                                srcRows + srcIndex * strideSize,
-                                strideSize);
-                }
+                break;
             }
+
+            const std::size_t srcLeftOffset = static_cast<std::size_t>(cropLeft) * bytesPerPixel;
+            if (srcLeftOffset >= sampleStride)
+            {
+                break;
+            }
+
+            const std::size_t availableRowBytes = sampleStride - srcLeftOffset;
+            const std::size_t copyBytes = std::min<std::size_t>(dstStride, availableRowBytes);
+
+            const std::uint8_t* srcRow = srcRows + srcOffset + srcLeftOffset;
+            std::uint8_t* dstRow = dst.data.data() + static_cast<std::size_t>(row) * dstStride;
+            std::memcpy(dstRow, srcRow, copyBytes);
+            if (copyBytes < dstStride)
+            {
+                std::memset(dstRow + copyBytes, 0, dstStride - copyBytes);
+            }
+
+            bytesWritten += dstStride;
         }
 
-        const std::size_t copiedBytes = availableRows * strideSize;
-        if (copiedBytes < requiredBytes)
+        if (bytesWritten < dst.data.size())
         {
-            std::memset(dst.data.data() + copiedBytes, 0, requiredBytes - copiedBytes);
+            std::memset(dst.data.data() + bytesWritten, 0, dst.data.size() - bytesWritten);
         }
     }
     else
     {
-        std::memset(dst.data.data(), 0, requiredBytes);
+        std::memset(dst.data.data(), 0, dst.data.size());
     }
-
-    dst.stride = stride;
 
     static std::atomic<bool> loggedPixels{false};
     if (!loggedPixels.exchange(true))
@@ -832,6 +1056,8 @@ void Application::selectVideoDevice(const std::string& moniker)
     }
 
     settings_.videoDeviceMoniker = moniker;
+    settings_.videoPreferredWidth = 0;
+    settings_.videoPreferredHeight = 0;
     savePersistentSettings();
     logApp(std::string("[App] Selected video capture device: ") + settings_.videoDeviceMoniker);
     restartVideoCapture();
@@ -839,6 +1065,36 @@ void Application::selectVideoDevice(const std::string& moniker)
     {
         applyAudioPlaybackSetting();
     }
+    requestImmediateRender();
+}
+
+void Application::setVideoResolution(std::uint32_t width, std::uint32_t height)
+{
+    if (width == 0 || height == 0)
+    {
+        width = 0;
+        height = 0;
+    }
+
+    if (settings_.videoPreferredWidth == width && settings_.videoPreferredHeight == height)
+    {
+        return;
+    }
+
+    settings_.videoPreferredWidth = width;
+    settings_.videoPreferredHeight = height;
+    savePersistentSettings();
+
+    if (width == 0 || height == 0)
+    {
+        logApp("[App] Video resolution preference -> auto");
+    }
+    else
+    {
+        logApp("[App] Video resolution preference -> " + std::to_string(width) + "x" + std::to_string(height));
+    }
+
+    restartVideoCapture();
     requestImmediateRender();
 }
 
@@ -1089,6 +1345,14 @@ void Application::applySourceDimensions(std::uint32_t width, std::uint32_t heigh
 
     currentSourceWidth_.store(width, std::memory_order_release);
     currentSourceHeight_.store(height, std::memory_order_release);
+    static std::uint32_t lastLoggedWidth = 0;
+    static std::uint32_t lastLoggedHeight = 0;
+    if (width != lastLoggedWidth || height != lastLoggedHeight)
+    {
+        logApp("[App] Active capture resolution -> " + std::to_string(width) + "x" + std::to_string(height));
+        lastLoggedWidth = width;
+        lastLoggedHeight = height;
+    }
 
     lockedClientWidth_ = static_cast<int>(width);
     lockedClientHeight_ = static_cast<int>(height);
@@ -1390,6 +1654,8 @@ void Application::restartVideoCapture()
         DirectShowCapture::Options options;
         options.deviceMoniker = settings_.videoDeviceMoniker;
         options.enableAudio = audioEnabled_;
+        options.desiredWidth = settings_.videoPreferredWidth;
+        options.desiredHeight = settings_.videoPreferredHeight;
         directShowCapture_.start([this](const DirectShowCapture::Frame& frame) {
             handleFrame(frame);
         }, options);

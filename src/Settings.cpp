@@ -380,7 +380,15 @@ AppSettings SettingsManager::load()
     tryParseBool(content, "mouseAbsoluteMode", settings.mouseAbsoluteMode);
     tryParseString(content, "inputTargetDevice", settings.inputTargetDevice);
     tryParseUInt(content, "serialBaudRate", settings.serialBaudRate);
+    tryParseUInt(content, "videoPreferredWidth", settings.videoPreferredWidth);
+    tryParseUInt(content, "videoPreferredHeight", settings.videoPreferredHeight);
     tryParseBool(content, "videoAllowResizing", settings.videoAllowResizing);
+
+    if (settings.videoPreferredWidth == 0 || settings.videoPreferredHeight == 0)
+    {
+        settings.videoPreferredWidth = 0;
+        settings.videoPreferredHeight = 0;
+    }
 
     unsigned int aspectModeValue = static_cast<unsigned int>(settings.videoAspectMode);
     if (tryParseUInt(content, "videoAspectMode", aspectModeValue))
@@ -451,6 +459,8 @@ void SettingsManager::save(const AppSettings& settings) const
     file << "  \"mouseAbsoluteMode\": " << (settings.mouseAbsoluteMode ? "true" : "false") << ",\n";
     file << "  \"inputTargetDevice\": \"" << escapeJson(settings.inputTargetDevice) << "\",\n";
     file << "  \"serialBaudRate\": " << settings.serialBaudRate << ",\n";
+    file << "  \"videoPreferredWidth\": " << settings.videoPreferredWidth << ",\n";
+    file << "  \"videoPreferredHeight\": " << settings.videoPreferredHeight << ",\n";
     file << "  \"videoAllowResizing\": " << (settings.videoAllowResizing ? "true" : "false") << ",\n";
     file << "  \"videoAspectMode\": " << static_cast<unsigned int>(settings.videoAspectMode) << ",\n";
     file << "  \"menuHotkey\": {\n";

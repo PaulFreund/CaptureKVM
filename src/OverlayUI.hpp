@@ -40,6 +40,7 @@ private:
 
     void showMenu(Application& app);
     void refreshDeviceLists(Application& app);
+    void refreshVideoModes(Application& app);
     void drawMenuWindow(Application& app);
 
     HWND hwnd_ = nullptr;
@@ -58,4 +59,5 @@ private:
     std::vector<AudioCaptureDeviceInfo> audioDevices_;
     std::vector<MicrophoneDeviceInfo> microphoneDevices_;
     std::vector<BridgeOption> bridgeDevices_;
+    std::vector<VideoModeInfo> videoModes_;
 };

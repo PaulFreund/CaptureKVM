@@ -439,11 +439,6 @@ LRESULT CALLBACK InputCaptureManager::mouseProc(int code, WPARAM wParam, LPARAM 
 
 void InputCaptureManager::handleKeyboardEvent(WPARAM wParam, const KBDLLHOOKSTRUCT& data)
 {
-    if (data.flags & LLKHF_INJECTED)
-    {
-        return;
-    }
-
     const bool keyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     const bool keyUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
     if (!keyDown && !keyUp)
@@ -453,10 +448,11 @@ void InputCaptureManager::handleKeyboardEvent(WPARAM wParam, const KBDLLHOOKSTRU
 
     const UINT vk = static_cast<UINT>(data.vkCode);
     const bool extended = (data.flags & LLKHF_EXTENDED) != 0;
+    const bool injected = (data.flags & LLKHF_INJECTED) != 0;
     const bool chordEnabled = menuChordEnabled_.load(std::memory_order_acquire);
     const bool chordCandidate = chordEnabled && isMenuChordKey(vk);
 
-    if (!chordCandidate)
+    if (!chordCandidate && !injected)
     {
         POINT cursor{};
         if (!GetCursorPos(&cursor) || !isWithinCaptureBounds(cursor))
@@ -588,15 +584,11 @@ void InputCaptureManager::updateModifierState(UINT vk, UINT scanCode, bool exten
 
 void InputCaptureManager::handleMouseEvent(WPARAM wParam, const MSLLHOOKSTRUCT& data)
 {
-    if (data.flags & LLMHF_INJECTED)
-    {
-        return;
-    }
-
     const bool absoluteMode = absoluteMode_.load(std::memory_order_acquire);
+    const bool injected = (data.flags & LLMHF_INJECTED) != 0;
 
     const bool insideBounds = isWithinCaptureBounds(data.pt);
-    if (!insideBounds)
+    if (!insideBounds && !injected)
     {
         hasLastMousePoint_ = false;
         if (!absoluteMode)

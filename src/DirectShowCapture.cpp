@@ -7,6 +7,7 @@
 #include <uuids.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -212,6 +213,10 @@ struct DirectShowCaptureImpl
     std::uint32_t frameWidth = 0;
     std::uint32_t frameHeight = 0;
     std::uint32_t frameStride = 0;
+    std::uint32_t contentLeft = 0;
+    std::uint32_t contentTop = 0;
+    std::uint32_t contentRight = 0;
+    std::uint32_t contentBottom = 0;
     bool bottomUp = false;
     std::atomic<bool> loggedSampleSize{false};
 
@@ -219,6 +224,8 @@ struct DirectShowCaptureImpl
     std::wstring selectedFriendlyName;
     std::wstring selectedMonikerDisplayName;
     bool audioEnabled = false;
+    std::uint32_t requestedWidth = 0;
+    std::uint32_t requestedHeight = 0;
 
     DirectShowCaptureImpl() = default;
 
@@ -239,6 +246,8 @@ struct DirectShowCaptureImpl
         selectedFriendlyName.clear();
         selectedMonikerDisplayName.clear();
         audioEnabled = options.enableAudio;
+        requestedWidth = options.desiredWidth;
+        requestedHeight = options.desiredHeight;
         if (running.exchange(true))
         {
             throw std::runtime_error("Capture already running");
@@ -537,12 +546,32 @@ struct DirectShowCaptureImpl
         throwIfFailed(sampleGrabber->SetBufferSamples(TRUE), "Failed to configure Sample Grabber buffering");
         throwIfFailed(sampleGrabber->SetCallback(callback, 1), "Failed to set Sample Grabber callback");
 
+        ComPtr<IAMStreamConfig> streamConfig;
+        HRESULT hrConfig = captureBuilder->FindInterface(&PIN_CATEGORY_CAPTURE,
+                                                         &MEDIATYPE_Video,
+                                                         captureFilter.Get(),
+                                                         IID_PPV_ARGS(streamConfig.GetAddressOf()));
+        if (FAILED(hrConfig) || !streamConfig)
+        {
+            hrConfig = captureBuilder->FindInterface(&PIN_CATEGORY_PREVIEW,
+                                                     &MEDIATYPE_Video,
+                                                     captureFilter.Get(),
+                                                     IID_PPV_ARGS(streamConfig.GetAddressOf()));
+        }
+
+        if (streamConfig && requestedWidth != 0 && requestedHeight != 0)
+        {
+            applyRequestedFormat(streamConfig.Get());
+        }
+
         HRESULT hr = captureBuilder->RenderStream(&PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video, captureFilter.Get(), sampleGrabberFilter.Get(), nullRenderer.Get());
         if (FAILED(hr))
         {
             hr = captureBuilder->RenderStream(&PIN_CATEGORY_PREVIEW, &MEDIATYPE_Video, captureFilter.Get(), sampleGrabberFilter.Get(), nullRenderer.Get());
         }
         throwIfFailed(hr, "Failed to build capture graph");
+
+        logCurrentFormat("Negotiated capture format (post RenderStream)");
 
         if (audioEnabled)
         {
@@ -562,34 +591,216 @@ struct DirectShowCaptureImpl
             }
         }
 
-        AM_MEDIA_TYPE connected{};
-        throwIfFailed(sampleGrabber->GetConnectedMediaType(&connected), "Failed to query connected media type");
+        logSampleGrabberFormat();
 
-        if (connected.formattype == FORMAT_VideoInfo && connected.cbFormat >= sizeof(VIDEOINFOHEADER))
+        throwIfFailed(graph->QueryInterface(IID_PPV_ARGS(&control)), "Failed to query IMediaControl");
+    }
+
+    void applyRequestedFormat(IAMStreamConfig* streamConfig)
+    {
+        if (!streamConfig || requestedWidth == 0 || requestedHeight == 0)
         {
-            const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(connected.pbFormat);
-            const LONG biWidth = vih->bmiHeader.biWidth;
-            const LONG biHeight = vih->bmiHeader.biHeight;
-            frameWidth = static_cast<std::uint32_t>(std::abs(biWidth));
-            frameHeight = static_cast<std::uint32_t>(std::abs(biHeight));
-            const DWORD bits = vih->bmiHeader.biBitCount ? vih->bmiHeader.biBitCount : 32;
-            frameStride = static_cast<std::uint32_t>(frameWidth * (bits / 8));
-            bottomUp = biHeight > 0;
-            logMessage("[Capture] Configured format: " + std::to_string(frameWidth) + "x" + std::to_string(frameHeight) + " stride=" + std::to_string(frameStride));
-            if (bottomUp)
+            return;
+        }
+
+        int capabilityCount = 0;
+        int capabilitySize = 0;
+        if (FAILED(streamConfig->GetNumberOfCapabilities(&capabilityCount, &capabilitySize)) || capabilityCount <= 0 || capabilitySize <= 0)
+        {
+            logMessage("[Capture] Requested format " + std::to_string(requestedWidth) + "x" + std::to_string(requestedHeight) + " not supported (no capabilities)");
+            return;
+        }
+
+        std::vector<std::uint8_t> capabilityBuffer(static_cast<std::size_t>(capabilitySize));
+        bool applied = false;
+
+        for (int i = 0; i < capabilityCount; ++i)
+        {
+            AM_MEDIA_TYPE* mediaType = nullptr;
+            if (FAILED(streamConfig->GetStreamCaps(i, &mediaType, capabilityBuffer.data())) || !mediaType)
             {
-                logMessage("[Capture] Frame data is bottom-up; will flip on upload");
+                continue;
+            }
+
+            const bool hasVideoInfo = mediaType->formattype == FORMAT_VideoInfo && mediaType->cbFormat >= sizeof(VIDEOINFOHEADER) && mediaType->pbFormat;
+            if (hasVideoInfo)
+            {
+                const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(mediaType->pbFormat);
+                const std::uint32_t width = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biWidth));
+                const std::uint32_t height = static_cast<std::uint32_t>(std::abs(vih->bmiHeader.biHeight));
+                if (width == requestedWidth && height == requestedHeight)
+                {
+                    if (SUCCEEDED(streamConfig->SetFormat(mediaType)))
+                    {
+                        logMessage("[Capture] Requested capture format " + std::to_string(requestedWidth) + "x" + std::to_string(requestedHeight) + " applied successfully");
+                        applied = true;
+                    }
+                    else
+                    {
+                        logMessage("[Capture] Failed to apply requested capture format " + std::to_string(requestedWidth) + "x" + std::to_string(requestedHeight));
+                    }
+                    freeMediaType(*mediaType);
+                    CoTaskMemFree(mediaType);
+                    break;
+                }
+            }
+
+            if (mediaType)
+            {
+                freeMediaType(*mediaType);
+                CoTaskMemFree(mediaType);
             }
         }
+
+        if (!applied)
+        {
+            logMessage("[Capture] Requested capture format " + std::to_string(requestedWidth) + "x" + std::to_string(requestedHeight) + " not found in device capabilities");
+        }
+    }
+
+    void logCurrentFormat(const std::string& context)
+    {
+        if (!captureBuilder || !captureFilter)
+        {
+            logMessage("[Capture] " + context + ": capture builder unavailable");
+            return;
+        }
+
+        ComPtr<IAMStreamConfig> streamConfig;
+        HRESULT hr = captureBuilder->FindInterface(&PIN_CATEGORY_CAPTURE,
+                                                    &MEDIATYPE_Video,
+                                                    captureFilter.Get(),
+                                                    IID_PPV_ARGS(streamConfig.GetAddressOf()));
+        if (FAILED(hr) || !streamConfig)
+        {
+            hr = captureBuilder->FindInterface(&PIN_CATEGORY_PREVIEW,
+                                               &MEDIATYPE_Video,
+                                               captureFilter.Get(),
+                                               IID_PPV_ARGS(streamConfig.GetAddressOf()));
+        }
+
+        if (FAILED(hr) || !streamConfig)
+        {
+            logMessage("[Capture] " + context + ": IAMStreamConfig not available");
+            return;
+        }
+
+        AM_MEDIA_TYPE* currentType = nullptr;
+        hr = streamConfig->GetFormat(&currentType);
+        if (FAILED(hr) || !currentType)
+        {
+            logMessage("[Capture] " + context + ": IAMStreamConfig::GetFormat failed");
+            return;
+        }
+
+        const bool hasVideoInfo = currentType->formattype == FORMAT_VideoInfo && currentType->cbFormat >= sizeof(VIDEOINFOHEADER);
+        if (!hasVideoInfo)
+        {
+            logMessage("[Capture] " + context + ": unexpected media type");
+        }
         else
+        {
+            const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(currentType->pbFormat);
+            describeVideoInfo(*vih, context, false);
+        }
+
+        if (currentType)
+        {
+            if (currentType->cbFormat != 0 && currentType->pbFormat)
+            {
+                CoTaskMemFree(currentType->pbFormat);
+                currentType->pbFormat = nullptr;
+                currentType->cbFormat = 0;
+            }
+            if (currentType->pUnk)
+            {
+                currentType->pUnk->Release();
+                currentType->pUnk = nullptr;
+            }
+            CoTaskMemFree(currentType);
+        }
+    }
+
+    void logSampleGrabberFormat()
+    {
+        if (!sampleGrabber)
+        {
+            return;
+        }
+
+        AM_MEDIA_TYPE connected{};
+        HRESULT hr = sampleGrabber->GetConnectedMediaType(&connected);
+        if (FAILED(hr))
+        {
+            logMessage("[Capture] SampleGrabber::GetConnectedMediaType failed");
+            return;
+        }
+
+        const bool hasVideoInfo = connected.formattype == FORMAT_VideoInfo && connected.cbFormat >= sizeof(VIDEOINFOHEADER);
+        if (!hasVideoInfo)
         {
             freeMediaType(connected);
             throw std::runtime_error("Sample Grabber did not provide a VIDEOINFOHEADER");
         }
 
+        const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(connected.pbFormat);
+        describeVideoInfo(*vih, "SampleGrabber format", true);
         freeMediaType(connected);
+    }
 
-        throwIfFailed(graph->QueryInterface(IID_PPV_ARGS(&control)), "Failed to query IMediaControl");
+    void describeVideoInfo(const VIDEOINFOHEADER& vih, const std::string& context, bool updateState)
+    {
+        const LONG biWidth = vih.bmiHeader.biWidth;
+        const LONG biHeight = vih.bmiHeader.biHeight;
+        const std::uint32_t width = static_cast<std::uint32_t>(std::abs(biWidth));
+        const std::uint32_t height = static_cast<std::uint32_t>(std::abs(biHeight));
+        const DWORD bits = vih.bmiHeader.biBitCount ? vih.bmiHeader.biBitCount : 32;
+
+        RECT active = vih.rcSource;
+        if (active.right <= active.left || active.bottom <= active.top)
+        {
+            active.left = 0;
+            active.top = 0;
+            active.right = static_cast<LONG>(width);
+            active.bottom = static_cast<LONG>(height);
+        }
+
+        const auto clampRect = [](LONG value, LONG minValue, LONG maxValue) {
+            return std::clamp(value, minValue, maxValue);
+        };
+
+        active.left = clampRect(active.left, 0, static_cast<LONG>(width));
+        active.top = clampRect(active.top, 0, static_cast<LONG>(height));
+        active.right = clampRect(active.right, active.left + 1, static_cast<LONG>(width));
+        active.bottom = clampRect(active.bottom, active.top + 1, static_cast<LONG>(height));
+
+        std::uint32_t bytesPerPixel = bits != 0 ? static_cast<std::uint32_t>((bits + 7u) / 8u) : 4u;
+        if (bytesPerPixel == 0)
+        {
+            bytesPerPixel = 4;
+        }
+        const std::uint32_t stride = width * bytesPerPixel;
+        const bool isBottomUp = biHeight > 0;
+
+        std::ostringstream oss;
+        oss << "[Capture] " << context
+            << ": frame=" << width << "x" << height
+            << " stride=" << stride
+            << " bottomUp=" << (isBottomUp ? "true" : "false")
+            << " rcSource={" << active.left << ", " << active.top << ", " << active.right << ", " << active.bottom << "}";
+        logMessage(oss.str());
+
+        if (updateState)
+        {
+            frameWidth = width;
+            frameHeight = height;
+            frameStride = stride;
+            bottomUp = isBottomUp;
+            contentLeft = static_cast<std::uint32_t>(active.left);
+            contentTop = static_cast<std::uint32_t>(active.top);
+            contentRight = static_cast<std::uint32_t>(active.right);
+            contentBottom = static_cast<std::uint32_t>(active.bottom);
+        }
     }
 
     HRESULT processBuffer(double sampleTime, const BYTE* buffer, long bufferLen)
@@ -607,8 +818,18 @@ struct DirectShowCaptureImpl
         DirectShowCapture::Frame frame{};
         frame.data = buffer;
         frame.dataSize = static_cast<std::size_t>(bufferLen);
-        frame.width = frameWidth;
-        frame.height = frameHeight;
+        frame.sampleWidth = frameWidth;
+        frame.sampleHeight = frameHeight;
+        frame.contentLeft = contentLeft;
+        frame.contentTop = contentTop;
+        frame.contentRight = contentRight != 0 ? contentRight : frameWidth;
+        frame.contentBottom = contentBottom != 0 ? contentBottom : frameHeight;
+
+        const std::uint32_t activeWidth = frame.contentRight > frame.contentLeft ? (frame.contentRight - frame.contentLeft) : frameWidth;
+        const std::uint32_t activeHeight = frame.contentBottom > frame.contentTop ? (frame.contentBottom - frame.contentTop) : frameHeight;
+
+        frame.width = activeWidth != 0 ? activeWidth : frameWidth;
+        frame.height = activeHeight != 0 ? activeHeight : frameHeight;
         frame.stride = frameStride != 0 ? frameStride : frameWidth * 4;
         frame.timestamp100ns = sampleTime >= 0.0 ? static_cast<std::uint64_t>(sampleTime * 10'000'000.0) : 0;
         frame.bottomUp = bottomUp;
@@ -658,6 +879,8 @@ struct DirectShowCaptureImpl
         graph.Reset();
         selectedMoniker.Reset();
         frameWidth = frameHeight = frameStride = 0;
+        contentLeft = contentTop = 0;
+        contentRight = contentBottom = 0;
         bottomUp = false;
         audioEnabled = false;
     }

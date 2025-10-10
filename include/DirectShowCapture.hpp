@@ -21,6 +21,12 @@ public:
         const std::uint8_t* data{};
         std::size_t dataSize{};
         bool bottomUp{};
+        std::uint32_t sampleWidth{};
+        std::uint32_t sampleHeight{};
+        std::uint32_t contentLeft{};
+        std::uint32_t contentTop{};
+        std::uint32_t contentRight{};
+        std::uint32_t contentBottom{};
     };
 
     using FrameHandler = std::function<void(const Frame&)>;
@@ -28,6 +34,8 @@ public:
     struct Options {
         std::string deviceMoniker;
         bool enableAudio = false;
+        std::uint32_t desiredWidth = 0;
+        std::uint32_t desiredHeight = 0;
     };
 
     DirectShowCapture();

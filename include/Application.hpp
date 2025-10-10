@@ -67,6 +67,7 @@ private:
     void selectVideoDevice(const std::string& moniker);
     void selectAudioDevice(const std::string& moniker);
     void selectMicrophoneDevice(const std::string& endpointId);
+    void setVideoResolution(std::uint32_t width, std::uint32_t height);
     void setVideoAllowResizing(bool enabled);
     void setVideoAspectMode(VideoAspectMode mode);
     void requestImmediateRender();
@@ -77,6 +78,8 @@ private:
     HWND hwnd() const { return hwnd_; }
     AppSettings& settings() { return settings_; }
     const AppSettings& settings() const { return settings_; }
+    std::uint32_t currentCaptureWidth() const { return currentSourceWidth_.load(std::memory_order_acquire); }
+    std::uint32_t currentCaptureHeight() const { return currentSourceHeight_.load(std::memory_order_acquire); }
 
     HWND hwnd_ = nullptr;
     D3DRenderer renderer_;
