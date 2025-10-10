@@ -10,6 +10,7 @@
 #include "MicrophoneCapture.hpp"
 #include "AudioPlayback.hpp"
 #include "OverlayUI.hpp"
+#include "DeviceEnumeration.hpp"
 
 #include <Windows.h>
 #include <atomic>
@@ -69,6 +70,10 @@ private:
     void setVideoAllowResizing(bool enabled);
     void setVideoAspectMode(VideoAspectMode mode);
     void requestImmediateRender();
+    void processPendingSourceDimensions();
+    void selectBridgeDevice(const SerialPortInfo& info, bool autoSelect);
+    bool classifyBridgeDevice(const SerialPortInfo& info, unsigned int* outBaud) const;
+    static std::string toLowerCopy(const std::string& text);
     HWND hwnd() const { return hwnd_; }
     AppSettings& settings() { return settings_; }
     const AppSettings& settings() const { return settings_; }

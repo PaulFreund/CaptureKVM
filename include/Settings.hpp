@@ -29,7 +29,7 @@ struct AppSettings {
     bool inputCaptureEnabled = true;
     bool mouseAbsoluteMode = true;
     std::string inputTargetDevice;
-    unsigned int serialBaudRate = 921600;
+    unsigned int serialBaudRate = 6000000;
     bool videoAllowResizing = true;
     VideoAspectMode videoAspectMode = VideoAspectMode::Maintain;
     HotkeyConfig menuHotkey;

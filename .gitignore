@@ -3,3 +3,4 @@ CMakeFiles/
 build/
 build_debug/
 pckvm.log
+imgui.ini

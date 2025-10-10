@@ -21,6 +21,8 @@ struct MicrophoneDeviceInfo {
 struct SerialPortInfo {
     std::string portName;
     std::string friendlyName;
+    std::string deviceDescription;
+    std::vector<std::string> hardwareIds;
 };
 
 std::vector<VideoDeviceInfo> enumerateVideoCaptureDevices();

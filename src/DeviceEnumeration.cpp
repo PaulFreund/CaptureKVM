@@ -208,12 +208,17 @@ std::vector<SerialPortInfo> enumerateSerialPorts()
 
     for (DWORD index = 0; SetupDiEnumDeviceInfo(deviceInfo, index, &deviceData); ++index)
     {
-        std::array<WCHAR, 256> buffer{};
         SerialPortInfo info;
+        std::array<WCHAR, 256> buffer{};
 
         if (SetupDiGetDeviceRegistryPropertyW(deviceInfo, &deviceData, SPDRP_FRIENDLYNAME, nullptr, reinterpret_cast<PBYTE>(buffer.data()), static_cast<DWORD>(buffer.size() * sizeof(WCHAR)), nullptr))
         {
             info.friendlyName = wideToUtf8(buffer.data());
+        }
+
+        if (SetupDiGetDeviceRegistryPropertyW(deviceInfo, &deviceData, SPDRP_DEVICEDESC, nullptr, reinterpret_cast<PBYTE>(buffer.data()), static_cast<DWORD>(buffer.size() * sizeof(WCHAR)), nullptr))
+        {
+            info.deviceDescription = wideToUtf8(buffer.data());
         }
 
         HKEY deviceKey = SetupDiOpenDevRegKey(deviceInfo, &deviceData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
@@ -228,6 +233,32 @@ std::vector<SerialPortInfo> enumerateSerialPorts()
                 info.portName = wideToUtf8(portBuffer.data());
             }
             RegCloseKey(deviceKey);
+        }
+
+        DWORD requiredSize = 0;
+        SetupDiGetDeviceRegistryPropertyW(deviceInfo,
+                                          &deviceData,
+                                          SPDRP_HARDWAREID,
+                                          nullptr,
+                                          nullptr,
+                                          0,
+                                          &requiredSize);
+        if (requiredSize > 0)
+        {
+            std::vector<WCHAR> hardwareIds((requiredSize / sizeof(WCHAR)) + 1);
+            if (SetupDiGetDeviceRegistryPropertyW(deviceInfo,
+                                                  &deviceData,
+                                                  SPDRP_HARDWAREID,
+                                                  nullptr,
+                                                  reinterpret_cast<PBYTE>(hardwareIds.data()),
+                                                  requiredSize,
+                                                  nullptr))
+            {
+                for (const WCHAR* id = hardwareIds.data(); id && *id; id += wcslen(id) + 1)
+                {
+                    info.hardwareIds.push_back(wideToUtf8(id));
+                }
+            }
         }
 
         if (!info.portName.empty())

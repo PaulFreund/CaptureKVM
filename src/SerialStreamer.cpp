@@ -26,12 +26,16 @@ namespace
     constexpr unsigned int kTargetVid = 0x303A;
     constexpr unsigned int kTargetPid = 0x1001;
     constexpr wchar_t kTargetDescription[] = L"USB JTAG/serial debug unit";
+    constexpr unsigned int kTargetVidAlt = 0x1A86;
+    constexpr unsigned int kTargetPidAlt = 0x55D3;
+    constexpr wchar_t kTargetDescriptionAlt[] = L"USB Single Serial";
     constexpr std::uint8_t kFrameSync0 = 0xD5;
     constexpr std::uint8_t kFrameSync1 = 0xAA;
     constexpr std::uint8_t kTypeKeyboard = 0x01;
     constexpr std::uint8_t kTypeMouse = 0x02;
     constexpr std::uint8_t kTypeMicrophone = 0x03;
     constexpr std::uint8_t kTypeMouseAbsolute = 0x04;
+    constexpr DWORD kSerialBacklogThresholdBytes = 16 * 1024; // roughly 0.17 s of audio
 
     void logSerial(const std::string& message)
     {
@@ -228,7 +232,7 @@ void SerialStreamer::setBaudRate(unsigned int baudRate)
 {
     if (baudRate == 0)
     {
-        return;
+        baudRate = kDefaultBaudRate;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -237,6 +241,18 @@ void SerialStreamer::setBaudRate(unsigned int baudRate)
         return;
     }
     baudRate_ = baudRate;
+    portDirty_ = true;
+    cv_.notify_one();
+}
+
+void SerialStreamer::setPreferredPort(const std::wstring& portName)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (preferredPortName_ == portName)
+    {
+        return;
+    }
+    preferredPortName_ = portName;
     portDirty_ = true;
     cv_.notify_one();
 }
@@ -273,7 +289,17 @@ void SerialStreamer::publishMouseAbsoluteReport(const std::array<std::uint8_t, 7
 
 void SerialStreamer::publishMicrophoneSamples(const std::uint8_t* data, std::size_t byteCount)
 {
-    if (!data || byteCount == 0)
+    if (!data || byteCount == 0 || !isRunning())
+    {
+        return;
+    }
+
+    bool serialReady = true;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        serialReady = (portHandle_ != INVALID_HANDLE_VALUE) && !portDirty_;
+    }
+    if (!serialReady)
     {
         return;
     }
@@ -369,20 +395,20 @@ void SerialStreamer::workerLoop()
                 return exitRequested_ || portDirty_ || totalQueued_ > 0;
             });
 
-        if (exitRequested_)
-        {
-            break;
-        }
-
-        if (portDirty_)
-        {
-            closeDeviceLocked();
-            flushQueueLocked();
-            portDirty_ = false;
-            if (!openDeviceLocked())
+            if (exitRequested_)
             {
-                portDirty_ = true;
-                lock.unlock();
+                break;
+            }
+
+            if (portDirty_)
+            {
+                closeDeviceLocked();
+                flushQueueLocked();
+                portDirty_ = false;
+                if (!openDeviceLocked())
+                {
+                    portDirty_ = true;
+                    lock.unlock();
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
                     continue;
                 }
@@ -455,6 +481,36 @@ void SerialStreamer::workerLoop()
             }
 
             offset += written;
+
+            DWORD errors = 0;
+            COMSTAT status{};
+            if (!ClearCommError(handle, &errors, &status))
+            {
+                logSerial("[Serial] ClearCommError failed after write");
+                std::lock_guard<std::mutex> lock(mutex_);
+                closeDeviceLocked();
+                portDirty_ = true;
+                cv_.notify_one();
+                break;
+            }
+
+            if (status.cbOutQue > kSerialBacklogThresholdBytes)
+            {
+                logSerial("[Serial] Detected " + std::to_string(status.cbOutQue) + " bytes pending on COM port, reconnecting");
+                std::lock_guard<std::mutex> lock(mutex_);
+                PurgeComm(handle, PURGE_TXCLEAR | PURGE_RXCLEAR);
+                closeDeviceLocked();
+                portDirty_ = true;
+                cv_.notify_one();
+                break;
+            }
+
+            if (errors != 0)
+            {
+                std::ostringstream oss;
+                oss << "[Serial] Comm error mask 0x" << std::hex << errors;
+                logSerial(oss.str());
+            }
         }
     }
 
@@ -474,7 +530,15 @@ bool SerialStreamer::openDeviceLocked()
         return true;
     }
 
-    const std::wstring portName = findPortName();
+    std::wstring portName;
+    if (!preferredPortName_.empty())
+    {
+        portName = preferredPortName_;
+    }
+    else
+    {
+        portName = findPortName();
+    }
     if (portName.empty())
     {
         logSerial("[Serial] Target serial bridge not found");
@@ -498,7 +562,31 @@ bool SerialStreamer::openDeviceLocked()
     if (handle == INVALID_HANDLE_VALUE)
     {
         logSerial("[Serial] Failed to open port '" + narrow(portName) + "' (error " + std::to_string(GetLastError()) + ")");
-        return false;
+        if (!preferredPortName_.empty())
+        {
+            const std::wstring fallback = findPortName();
+            if (!fallback.empty() && fallback != portName)
+            {
+                logSerial("[Serial] Falling back to auto-detected port '" + narrow(fallback) + "'");
+                portName = fallback;
+                std::wstring devicePathFallback = fallback;
+                if (devicePathFallback.rfind(L"\\.\\", 0) != 0)
+                {
+                    devicePathFallback = L"\\.\\" + devicePathFallback;
+                }
+                handle = CreateFileW(devicePathFallback.c_str(),
+                                    GENERIC_WRITE,
+                                    0,
+                                    nullptr,
+                                    OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                                    nullptr);
+            }
+        }
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
     }
 
     SetupComm(handle, 4096, 4096);
@@ -546,7 +634,7 @@ bool SerialStreamer::openDeviceLocked()
     portHandle_ = handle;
     currentPortName_ = portName;
 
-    logSerial("[Serial] Connected to " + narrow(portName));
+    logSerial("[Serial] Connected to " + narrow(portName) + " with " + std::to_string(baudRate_) + " baud");
     return true;
 }
 
@@ -554,6 +642,7 @@ void SerialStreamer::closeDeviceLocked()
 {
     if (portHandle_ != INVALID_HANDLE_VALUE)
     {
+        PurgeComm(portHandle_, PURGE_TXCLEAR | PURGE_RXCLEAR);
         CloseHandle(portHandle_);
         portHandle_ = INVALID_HANDLE_VALUE;
         logSerial("[Serial] Disconnected from serial bridge");
@@ -570,15 +659,25 @@ std::wstring SerialStreamer::findPortName() const
     }
 
     std::wstring result;
-    const std::wstring targetDescLower = toLower(std::wstring(kTargetDescription));
+    const std::wstring descEsp = toLower(std::wstring(kTargetDescription));
+    const std::wstring descAlt = toLower(std::wstring(kTargetDescriptionAlt));
 
-    std::wstringstream vidStream;
-    vidStream << L"vid_" << std::hex << std::nouppercase << std::setw(4) << std::setfill(L'0') << kTargetVid;
-    const std::wstring vidToken = toLower(vidStream.str());
+    auto makeVidToken = [](unsigned int vid) {
+        std::wstringstream stream;
+        stream << L"vid_" << std::hex << std::nouppercase << std::setw(4) << std::setfill(L'0') << vid;
+        return toLower(stream.str());
+    };
 
-    std::wstringstream pidStream;
-    pidStream << L"pid_" << std::hex << std::nouppercase << std::setw(4) << std::setfill(L'0') << kTargetPid;
-    const std::wstring pidToken = toLower(pidStream.str());
+    auto makePidToken = [](unsigned int pid) {
+        std::wstringstream stream;
+        stream << L"pid_" << std::hex << std::nouppercase << std::setw(4) << std::setfill(L'0') << pid;
+        return toLower(stream.str());
+    };
+
+    const std::wstring vidEsp = makeVidToken(kTargetVid);
+    const std::wstring pidEsp = makePidToken(kTargetPid);
+    const std::wstring vidAlt = makeVidToken(kTargetVidAlt);
+    const std::wstring pidAlt = makePidToken(kTargetPidAlt);
 
     SP_DEVINFO_DATA deviceData{};
     deviceData.cbSize = sizeof(deviceData);
@@ -597,7 +696,7 @@ std::wstring SerialStreamer::findPortName() const
                                               nullptr))
         {
             const std::wstring descLower = toLower(std::wstring(buffer.data()));
-            if (descLower.find(targetDescLower) != std::wstring::npos)
+            if (descLower.find(descEsp) != std::wstring::npos || descLower.find(descAlt) != std::wstring::npos)
             {
                 matches = true;
             }
@@ -614,7 +713,7 @@ std::wstring SerialStreamer::findPortName() const
                                                   nullptr))
             {
                 const std::wstring friendlyLower = toLower(std::wstring(buffer.data()));
-                if (friendlyLower.find(targetDescLower) != std::wstring::npos)
+                if (friendlyLower.find(descEsp) != std::wstring::npos || friendlyLower.find(descAlt) != std::wstring::npos)
                 {
                     matches = true;
                 }
@@ -645,7 +744,9 @@ std::wstring SerialStreamer::findPortName() const
                     for (const wchar_t* id = hardwareIds.data(); id && *id; id += wcslen(id) + 1)
                     {
                         std::wstring idLower = toLower(id);
-                        if (idLower.find(vidToken) != std::wstring::npos && idLower.find(pidToken) != std::wstring::npos)
+                        const bool espMatch = idLower.find(vidEsp) != std::wstring::npos && idLower.find(pidEsp) != std::wstring::npos;
+                        const bool altMatch = idLower.find(vidAlt) != std::wstring::npos && idLower.find(pidAlt) != std::wstring::npos;
+                        if (espMatch || altMatch)
                         {
                             matches = true;
                             break;

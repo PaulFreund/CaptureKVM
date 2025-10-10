@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -29,6 +30,7 @@ namespace
 
     constexpr UINT_PTR kTimerRenderDuringInteraction = 0x7101;
     const std::string kAudioSourceVideoSentinel = "@video";
+    constexpr unsigned int kSerialBaudRateDefault = 6000000;
 
     std::wstring utf8ToWide(const std::string& text)
     {
@@ -559,17 +561,7 @@ void Application::renderLoop()
             DispatchMessage(&msg);
         }
 
-        if (sourceChangePending_.load(std::memory_order_acquire))
-        {
-            const std::uint32_t newWidth = pendingSourceWidth_.load(std::memory_order_acquire);
-            const std::uint32_t newHeight = pendingSourceHeight_.load(std::memory_order_acquire);
-            if (newWidth != 0 && newHeight != 0)
-            {
-                applySourceDimensions(newWidth, newHeight);
-            }
-            sourceChangePending_.store(false, std::memory_order_release);
-        }
-
+        processPendingSourceDimensions();
         renderFrame(false);
     }
 }
@@ -584,7 +576,7 @@ void Application::loadPersistentSettings()
     }
     if (settings_.serialBaudRate == 0)
     {
-        settings_.serialBaudRate = 921600;
+        settings_.serialBaudRate = kSerialBaudRateDefault;
     }
     if (settings_.audioPlaybackEnabled && settings_.audioDeviceMoniker.empty())
     {
@@ -782,7 +774,10 @@ void Application::applySerialTargetSetting()
     {
         serialStreamer_.start();
     }
-    serialStreamer_.setBaudRate(settings_.serialBaudRate);
+    const unsigned int baud = settings_.serialBaudRate == 0 ? kSerialBaudRateDefault : settings_.serialBaudRate;
+    serialStreamer_.setBaudRate(baud);
+    const std::wstring preferred = utf8ToWide(settings_.inputTargetDevice);
+    serialStreamer_.setPreferredPort(preferred);
     serialStreamer_.requestReconnect();
 }
 
@@ -965,8 +960,25 @@ bool Application::uploadLatestFrame()
     return true;
 }
 
+void Application::processPendingSourceDimensions()
+{
+    if (!sourceChangePending_.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    const std::uint32_t newWidth = pendingSourceWidth_.load(std::memory_order_acquire);
+    const std::uint32_t newHeight = pendingSourceHeight_.load(std::memory_order_acquire);
+    if (newWidth != 0 && newHeight != 0)
+    {
+        applySourceDimensions(newWidth, newHeight);
+    }
+    sourceChangePending_.store(false, std::memory_order_release);
+}
+
 void Application::renderFrame(bool forcePresent)
 {
+    processPendingSourceDimensions();
     overlay_.newFrame();
     overlay_.buildUI(*this);
     overlay_.endFrame();
@@ -986,6 +998,86 @@ void Application::renderFrame(bool forcePresent)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+}
+
+void Application::selectBridgeDevice(const SerialPortInfo& info, bool autoSelect)
+{
+    unsigned int suggestedBaud = settings_.serialBaudRate == 0 ? kSerialBaudRateDefault : settings_.serialBaudRate;
+    if (!classifyBridgeDevice(info, &suggestedBaud))
+    {
+        if (suggestedBaud == 0)
+        {
+            suggestedBaud = kSerialBaudRateDefault;
+        }
+    }
+
+    const bool deviceChanged = settings_.inputTargetDevice != info.portName;
+    const bool baudChanged = settings_.serialBaudRate != suggestedBaud;
+    if (!deviceChanged && !baudChanged && autoSelect)
+    {
+        return;
+    }
+
+    settings_.inputTargetDevice = info.portName;
+    settings_.serialBaudRate = suggestedBaud;
+    savePersistentSettings();
+
+    logApp(std::string("[App] Bridge device -> ") + info.portName + " (baud " + std::to_string(suggestedBaud) + ")");
+
+    serialStreamer_.setBaudRate(suggestedBaud);
+
+    std::wstring preferred = utf8ToWide(info.portName);
+    serialStreamer_.setPreferredPort(preferred);
+    serialStreamer_.requestReconnect();
+}
+
+bool Application::classifyBridgeDevice(const SerialPortInfo& info, unsigned int* outBaud) const
+{
+    constexpr unsigned int kBaudEsp = kSerialBaudRateDefault;
+    constexpr unsigned int kBaudAlt = kSerialBaudRateDefault;
+
+    const std::string friendlyLower = toLowerCopy(info.friendlyName);
+    const std::string descLower = toLowerCopy(info.deviceDescription);
+
+    auto hardwareMatch = [&](const std::string& vidToken, const std::string& pidToken) {
+        for (const auto& id : info.hardwareIds)
+        {
+            std::string idLower = toLowerCopy(id);
+            if (idLower.find(vidToken) != std::string::npos && idLower.find(pidToken) != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const bool isEsp = hardwareMatch("vid_303a", "pid_1001") ||
+                       friendlyLower.find("usb jtag/serial debug unit") != std::string::npos ||
+                       descLower.find("usb jtag/serial debug unit") != std::string::npos;
+
+    const bool isAlt = hardwareMatch("vid_1a86", "pid_55d3") ||
+                       friendlyLower.find("usb single serial") != std::string::npos ||
+                       descLower.find("usb single serial") != std::string::npos;
+
+    if (!isEsp && !isAlt)
+    {
+        return false;
+    }
+
+    if (outBaud)
+    {
+        *outBaud = isAlt ? kBaudAlt : kBaudEsp;
+    }
+    return true;
+}
+
+std::string Application::toLowerCopy(const std::string& text)
+{
+    std::string result = text;
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return result;
 }
 
 void Application::applySourceDimensions(std::uint32_t width, std::uint32_t height)
@@ -1165,9 +1257,17 @@ RECT Application::computeVideoViewport(const RECT& clientRect, bool& valid) cons
 
     case VideoAspectMode::Capture:
     {
-        double scale = std::min<double>({static_cast<double>(clientWidth) / static_cast<double>(srcWidth),
-                                         static_cast<double>(clientHeight) / static_cast<double>(srcHeight),
-                                         1.0});
+        double scale = std::min<double>(static_cast<double>(clientWidth) / static_cast<double>(srcWidth),
+                                        static_cast<double>(clientHeight) / static_cast<double>(srcHeight));
+        if (scale <= 0.0)
+        {
+            scale = 1.0;
+        }
+        if (scale > 1.0)
+        {
+            scale = 1.0; // never upscale beyond native resolution
+        }
+
         int viewportWidth = static_cast<int>(std::round(static_cast<double>(srcWidth) * scale));
         int viewportHeight = static_cast<int>(std::round(static_cast<double>(srcHeight) * scale));
         viewportWidth = std::max(1, std::min(viewportWidth, static_cast<int>(clientWidth)));

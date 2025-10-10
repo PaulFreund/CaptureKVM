@@ -33,6 +33,11 @@ public:
     bool isMenuVisible() const { return menuVisible_; }
 
 private:
+    struct BridgeOption {
+        SerialPortInfo port;
+        unsigned int suggestedBaud = 6000000;
+    };
+
     void showMenu(Application& app);
     void refreshDeviceLists(Application& app);
     void drawMenuWindow(Application& app);
@@ -52,4 +57,5 @@ private:
     std::vector<VideoDeviceInfo> videoDevices_;
     std::vector<AudioCaptureDeviceInfo> audioDevices_;
     std::vector<MicrophoneDeviceInfo> microphoneDevices_;
+    std::vector<BridgeOption> bridgeDevices_;
 };

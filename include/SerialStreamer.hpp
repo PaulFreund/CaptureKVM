@@ -22,6 +22,7 @@ public:
 
     void requestReconnect();
     void setBaudRate(unsigned int baudRate);
+    void setPreferredPort(const std::wstring& portName);
 
     void publishKeyboardReport(const std::array<std::uint8_t, 8>& report);
     void publishMouseReport(const std::array<std::uint8_t, 5>& report);
@@ -31,6 +32,8 @@ public:
     [[nodiscard]] bool isRunning() const noexcept { return running_.load(std::memory_order_acquire); }
 
 private:
+    static constexpr unsigned int kDefaultBaudRate = 6000000;
+
     enum class PacketType : std::uint8_t {
         Keyboard = 0x01,
         Mouse = 0x02,
@@ -61,5 +64,6 @@ private:
     bool portDirty_ = false;
     HANDLE portHandle_ = INVALID_HANDLE_VALUE;
     std::wstring currentPortName_;
-    unsigned int baudRate_ = 921600;
+    std::wstring preferredPortName_;
+    unsigned int baudRate_ = kDefaultBaudRate;
 };
