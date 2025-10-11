@@ -440,289 +440,65 @@ void Application::handleFrame(const DirectShowCapture::Frame& frame)
 
     dst.timestamp100ns = frame.timestamp100ns;
 
-    constexpr std::uint32_t bytesPerPixel = 4;
-    const std::uint32_t sampleStride = frame.stride != 0
-        ? frame.stride
-        : (frame.sampleWidth != 0 ? frame.sampleWidth * bytesPerPixel : frame.width * bytesPerPixel);
-    const std::uint32_t sampleWidth = frame.sampleWidth != 0
-        ? frame.sampleWidth
-        : (sampleStride != 0 ? sampleStride / bytesPerPixel : frame.width);
-    const std::uint32_t sampleHeight = frame.sampleHeight != 0 ? frame.sampleHeight : frame.height;
+    const std::uint32_t frameWidth = frame.width;
+    const std::uint32_t frameHeight = frame.height;
+    const std::uint32_t stride = frame.stride != 0 ? frame.stride : frameWidth * 4;
 
-    const std::uint8_t* srcRows = static_cast<const std::uint8_t*>(frame.data);
-
-    auto clampValue = [](std::uint32_t value, std::uint32_t minValue, std::uint32_t maxValue) {
-        return std::max(minValue, std::min(value, maxValue));
-    };
-
-    auto brightnessAt = [&](std::uint32_t x, std::uint32_t y) -> std::uint8_t {
-        if (!srcRows || x >= sampleWidth || y >= sampleHeight)
-        {
-            return 0;
-        }
-        const std::uint32_t srcY = frame.bottomUp ? (sampleHeight - 1u - y) : y;
-        const std::size_t rowOffset = static_cast<std::size_t>(srcY) * sampleStride;
-        const std::size_t pixelOffset = static_cast<std::size_t>(x) * bytesPerPixel;
-        const std::size_t required = rowOffset + pixelOffset + (bytesPerPixel - 1u);
-        if (required >= frame.dataSize)
-        {
-            return 0;
-        }
-        const std::uint8_t* px = srcRows + rowOffset + pixelOffset;
-        return std::max({px[0], px[1], px[2]});
-    };
-
-    auto detectActiveRegion = [&](std::uint32_t& left,
-                                  std::uint32_t& top,
-                                  std::uint32_t& right,
-                                  std::uint32_t& bottom) -> bool {
-        if (!srcRows || sampleWidth == 0 || sampleHeight == 0)
-        {
-            return false;
-        }
-
-        const std::uint32_t stepX = std::max<std::uint32_t>(1, sampleWidth / 256u);
-        const std::uint32_t stepY = std::max<std::uint32_t>(1, sampleHeight / 256u);
-        constexpr std::uint8_t kIntensityThreshold = 16;
-        constexpr std::uint32_t kMinHits = 2;
-
-        std::uint32_t detectedTop = 0;
-        bool foundTop = false;
-        for (std::uint32_t y = 0; y < sampleHeight; ++y)
-        {
-            std::uint32_t hits = 0;
-            for (std::uint32_t x = 0; x < sampleWidth; x += stepX)
-            {
-                if (brightnessAt(x, y) > kIntensityThreshold)
-                {
-                    if (++hits >= kMinHits)
-                    {
-                        foundTop = true;
-                        detectedTop = y;
-                        break;
-                    }
-                }
-            }
-            if (foundTop)
-            {
-                break;
-            }
-        }
-        if (!foundTop)
-        {
-            return false;
-        }
-
-        std::uint32_t detectedBottom = sampleHeight - 1;
-        bool foundBottom = false;
-        for (std::uint32_t y = sampleHeight; y-- > detectedTop;)
-        {
-            std::uint32_t hits = 0;
-            for (std::uint32_t x = 0; x < sampleWidth; x += stepX)
-            {
-                if (brightnessAt(x, y) > kIntensityThreshold)
-                {
-                    if (++hits >= kMinHits)
-                    {
-                        foundBottom = true;
-                        detectedBottom = y;
-                        break;
-                    }
-                }
-            }
-            if (foundBottom)
-            {
-                break;
-            }
-        }
-        if (!foundBottom || detectedBottom <= detectedTop)
-        {
-            return false;
-        }
-
-        std::uint32_t detectedLeft = 0;
-        bool foundLeft = false;
-        for (std::uint32_t x = 0; x < sampleWidth; ++x)
-        {
-            std::uint32_t hits = 0;
-            for (std::uint32_t y = detectedTop; y <= detectedBottom; y += stepY)
-            {
-                if (brightnessAt(x, y) > kIntensityThreshold)
-                {
-                    if (++hits >= kMinHits)
-                    {
-                        foundLeft = true;
-                        detectedLeft = x;
-                        break;
-                    }
-                }
-            }
-            if (foundLeft)
-            {
-                break;
-            }
-        }
-        if (!foundLeft)
-        {
-            return false;
-        }
-
-        std::uint32_t detectedRight = sampleWidth - 1;
-        bool foundRight = false;
-        for (std::uint32_t x = sampleWidth; x-- > detectedLeft;)
-        {
-            std::uint32_t hits = 0;
-            for (std::uint32_t y = detectedTop; y <= detectedBottom; y += stepY)
-            {
-                if (brightnessAt(x, y) > kIntensityThreshold)
-                {
-                    if (++hits >= kMinHits)
-                    {
-                        foundRight = true;
-                        detectedRight = x;
-                        break;
-                    }
-                }
-            }
-            if (foundRight)
-            {
-                break;
-            }
-        }
-        if (!foundRight || detectedRight <= detectedLeft)
-        {
-            return false;
-        }
-
-        constexpr std::uint32_t kMargin = 2;
-        const std::uint32_t extendedLeft = detectedLeft > kMargin ? detectedLeft - kMargin : 0u;
-        const std::uint32_t extendedTop = detectedTop > kMargin ? detectedTop - kMargin : 0u;
-        const std::uint32_t extendedRight = std::min<std::uint32_t>(detectedRight + kMargin + 1u, sampleWidth);
-        const std::uint32_t extendedBottom = std::min<std::uint32_t>(detectedBottom + kMargin + 1u, sampleHeight);
-
-        left = clampValue(extendedLeft, 0u, sampleWidth > 0 ? sampleWidth - 1u : 0u);
-        top = clampValue(extendedTop, 0u, sampleHeight > 0 ? sampleHeight - 1u : 0u);
-        right = clampValue(extendedRight, left + 1u, sampleWidth);
-        bottom = clampValue(extendedBottom, top + 1u, sampleHeight);
-        return true;
-    };
-
-    std::uint32_t cropLeft = std::min(frame.contentLeft, sampleWidth);
-    std::uint32_t cropTop = std::min(frame.contentTop, sampleHeight);
-    std::uint32_t cropRight = frame.contentRight > cropLeft ? std::min(frame.contentRight, sampleWidth) : sampleWidth;
-    std::uint32_t cropBottom = frame.contentBottom > cropTop ? std::min(frame.contentBottom, sampleHeight) : sampleHeight;
-
-    const bool driverProvidedCrop = (cropLeft != 0 || cropTop != 0 || cropRight != sampleWidth || cropBottom != sampleHeight);
-    std::uint32_t detectedLeft = cropLeft;
-    std::uint32_t detectedTop = cropTop;
-    std::uint32_t detectedRight = cropRight;
-    std::uint32_t detectedBottom = cropBottom;
-    if (detectActiveRegion(detectedLeft, detectedTop, detectedRight, detectedBottom))
-    {
-        cropLeft = driverProvidedCrop ? std::max(cropLeft, detectedLeft) : detectedLeft;
-        cropTop = driverProvidedCrop ? std::max(cropTop, detectedTop) : detectedTop;
-        cropRight = driverProvidedCrop ? std::min(cropRight, detectedRight) : detectedRight;
-        cropBottom = driverProvidedCrop ? std::min(cropBottom, detectedBottom) : detectedBottom;
-        if (cropRight <= cropLeft)
-        {
-            cropRight = detectedRight;
-        }
-        if (cropBottom <= cropTop)
-        {
-            cropBottom = detectedBottom;
-        }
-    }
-
-    std::uint32_t contentWidth = cropRight > cropLeft ? (cropRight - cropLeft) : sampleWidth;
-    std::uint32_t contentHeight = cropBottom > cropTop ? (cropBottom - cropTop) : sampleHeight;
-
-    contentWidth = std::max<std::uint32_t>(1, std::min(contentWidth, sampleWidth));
-    contentHeight = std::max<std::uint32_t>(1, std::min(contentHeight, sampleHeight));
-
-    static std::atomic<bool> loggedAutoCrop{false};
-    if (!driverProvidedCrop && (cropLeft != 0 || cropTop != 0 || cropRight != sampleWidth || cropBottom != sampleHeight))
-    {
-        if (!loggedAutoCrop.exchange(true))
-        {
-            logApp("[App] Auto-detected active video region: left=" + std::to_string(cropLeft)
-                   + " top=" + std::to_string(cropTop)
-                   + " right=" + std::to_string(cropRight)
-                   + " bottom=" + std::to_string(cropBottom)
-                   + " (" + std::to_string(contentWidth) + "x" + std::to_string(contentHeight) + ")");
-        }
-    }
-
-    dst.width = contentWidth;
-    dst.height = contentHeight;
+    dst.width = frameWidth;
+    dst.height = frameHeight;
 
     const std::uint32_t knownWidth = currentSourceWidth_.load(std::memory_order_acquire);
     const std::uint32_t knownHeight = currentSourceHeight_.load(std::memory_order_acquire);
-    if (contentWidth != knownWidth || contentHeight != knownHeight)
+    if (frameWidth != knownWidth || frameHeight != knownHeight)
     {
-        pendingSourceWidth_.store(contentWidth, std::memory_order_release);
-        pendingSourceHeight_.store(contentHeight, std::memory_order_release);
+        pendingSourceWidth_.store(frameWidth, std::memory_order_release);
+        pendingSourceHeight_.store(frameHeight, std::memory_order_release);
         sourceChangePending_.store(true, std::memory_order_release);
     }
 
-    inputCaptureManager_.setTargetResolution(static_cast<int>(contentWidth), static_cast<int>(contentHeight));
+    inputCaptureManager_.setTargetResolution(static_cast<int>(frameWidth), static_cast<int>(frameHeight));
 
-    const std::size_t expectedSampleBytes = static_cast<std::size_t>(sampleStride) * sampleHeight;
-    if (frame.dataSize < expectedSampleBytes)
+    const std::size_t requiredBytes = static_cast<std::size_t>(stride) * frameHeight;
+    if (frame.dataSize < requiredBytes)
     {
-        logApp("[App] Warning: frame data shorter than expected (" + std::to_string(frame.dataSize) + " < " + std::to_string(expectedSampleBytes) + ")");
+        logApp("[App] Warning: frame data shorter than expected (" + std::to_string(frame.dataSize) + " < " + std::to_string(requiredBytes) + ")");
     }
 
-    const std::uint32_t dstStride = contentWidth * bytesPerPixel;
-    dst.stride = dstStride;
-    dst.data.resize(static_cast<std::size_t>(dstStride) * contentHeight);
+    dst.stride = stride;
+    dst.data.resize(requiredBytes);
 
     const bool bottomUp = frame.bottomUp;
 
     if (frame.data && frame.dataSize > 0)
     {
-        std::size_t bytesWritten = 0;
-
-        for (std::uint32_t row = 0; row < contentHeight; ++row)
+        const auto* srcRows = static_cast<const std::uint8_t*>(frame.data);
+        if (!bottomUp)
         {
-            const std::uint32_t imageRow = cropTop + row;
-            const std::uint32_t srcRowIndex = bottomUp
-                ? (imageRow < sampleHeight ? (sampleHeight - 1u - imageRow) : 0u)
-                : imageRow;
-
-            if (srcRowIndex >= sampleHeight)
+            for (std::uint32_t y = 0; y < frameHeight; ++y)
             {
-                break;
+                const std::size_t offset = static_cast<std::size_t>(y) * stride;
+                const std::size_t copyBytes = std::min<std::size_t>(stride, frame.dataSize - offset);
+                std::memcpy(dst.data.data() + offset, srcRows + offset, copyBytes);
+                if (copyBytes < stride)
+                {
+                    std::memset(dst.data.data() + offset + copyBytes, 0, stride - copyBytes);
+                }
             }
-
-            const std::size_t srcOffset = static_cast<std::size_t>(srcRowIndex) * sampleStride;
-            if (srcOffset + sampleStride > frame.dataSize)
-            {
-                break;
-            }
-
-            const std::size_t srcLeftOffset = static_cast<std::size_t>(cropLeft) * bytesPerPixel;
-            if (srcLeftOffset >= sampleStride)
-            {
-                break;
-            }
-
-            const std::size_t availableRowBytes = sampleStride - srcLeftOffset;
-            const std::size_t copyBytes = std::min<std::size_t>(dstStride, availableRowBytes);
-
-            const std::uint8_t* srcRow = srcRows + srcOffset + srcLeftOffset;
-            std::uint8_t* dstRow = dst.data.data() + static_cast<std::size_t>(row) * dstStride;
-            std::memcpy(dstRow, srcRow, copyBytes);
-            if (copyBytes < dstStride)
-            {
-                std::memset(dstRow + copyBytes, 0, dstStride - copyBytes);
-            }
-
-            bytesWritten += dstStride;
         }
-
-        if (bytesWritten < dst.data.size())
+        else
         {
-            std::memset(dst.data.data() + bytesWritten, 0, dst.data.size() - bytesWritten);
+            for (std::uint32_t y = 0; y < frameHeight; ++y)
+            {
+                const std::uint32_t srcIndex = frameHeight - 1 - y;
+                const std::size_t srcOffset = static_cast<std::size_t>(srcIndex) * stride;
+                const std::size_t dstOffset = static_cast<std::size_t>(y) * stride;
+                const std::size_t copyBytes = std::min<std::size_t>(stride, frame.dataSize - srcOffset);
+                std::memcpy(dst.data.data() + dstOffset, srcRows + srcOffset, copyBytes);
+                if (copyBytes < stride)
+                {
+                    std::memset(dst.data.data() + dstOffset + copyBytes, 0, stride - copyBytes);
+                }
+            }
         }
     }
     else
